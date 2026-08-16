@@ -79,8 +79,10 @@ scripts/build_topology.py  create the lab, nodes, links
 scripts/gen_configs.py     render day-0 configs, optionally push them
 scripts/bootstrap_ssh.py   generate SSH host keys over telnet
 scripts/verify.py          the check ladder, run from the jump box
+scripts/lab_up.py          bring the fabric back after a power cycle, unattended
 cml/client.py              authenticated CML client
 docs/design.md             the design, the tradeoffs, and every gotcha found
+docs/inventory.md          every device, address and cable, and how to reach it
 ```
 
 `link-map.yml` matters more than it looks. It records the interface labels the
@@ -106,6 +108,27 @@ thing. Re-run `bootstrap_ssh.py` afterwards — a wipe takes the SSH host key wi
 
 Credentials live only in `~/.cml.env`, chmod 600, never in this repo. Rendered
 configs are gitignored: they embed the device password in cleartext.
+
+### After a power cycle
+
+CML does not auto-start labs — when the server reboots, every node comes back
+STOPPED. `lab_up.py` waits for the controller, starts the lab, waits for the nodes,
+and re-bootstraps any SSH host key that did not survive:
+
+```bash
+.venv/bin/python scripts/lab_up.py            # bring it up and wait
+.venv/bin/python scripts/lab_up.py --check    # report state, change nothing
+```
+
+It is safe to run at any time — on an already-running fabric it does nothing and
+exits 0, which is what makes it usable from `@reboot` cron.
+
+Two things measured while testing it, both of which shape how it waits. CML's
+`STARTED` means only that the node process is running, so the readiness gate gates
+on `BOOTED` alone — every node type here, external connector included, reaches it.
+And `BOOTED` still is not the same as "IOS is answering": a leaf can report BOOTED
+with neither SSH nor telnet up yet, so the host-key step is retried rather than
+trusted on the first pass.
 
 ## Verification
 
