@@ -1,0 +1,26 @@
+# Never commit credentials
+.cml.env
+*.env
+!example.env
+secrets.yml
+*.pem
+*.key
+
+# Rendered configs embed the device password in cleartext ('username ... secret').
+# They are a build artifact -- regenerate with scripts/gen_configs.py, never commit.
+configs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Ansible
+*.retry
+ansible/inventory/generated_*.yml
+fact_cache/
+
+# Local scratch
+scratch/
+*.log

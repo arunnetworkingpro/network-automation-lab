@@ -1,0 +1,7 @@
+virl2_client
+ansible-core
+paramiko
+netaddr
+jinja2
+rich
+pyyaml

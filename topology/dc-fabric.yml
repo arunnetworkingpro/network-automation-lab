@@ -1,0 +1,103 @@
+# Single source of truth for the lab. build_topology.py reads this and creates
+# the CML lab; the Ansible inventory is generated from it too. Edit here, not in
+# the CML GUI, or the two drift apart.
+---
+lab:
+  title: "dc-fabric-phase1"
+  description: "Classic L2/L3 spine-leaf. OSPF underlay + iBGP, VLANs/SVIs at the leaves."
+
+# VERIFIED AT DISCOVERY against the 2.9.1 controller on 15 Aug 2026. The L2 node is
+# 'ioll2-xe' -- note the ordering, not the 'iol-xe-l2' you would reasonably guess.
+# This is why discovery runs before the build.
+node_defs:
+  spine: iol-xe          # L3-only, Linux process not a VM (~512 MB)
+  leaf: ioll2-xe         # L2 switching + SVIs (~768 MB)
+  jump: ubuntu           # jump server (2 GB)
+  server: alpine         # workload hosts (512 MB)
+  external: external_connector
+
+underlay:
+  igp: ospf
+  ospf_area: 0
+  bgp_asn: 65000         # single AS, iBGP; spines are route reflectors
+  loopback_net: 10.0.0.0/24
+  p2p_net: 10.1.0.0/16   # carved into /31s per spine-leaf link
+
+spines:
+  - name: spine1
+    loopback: 10.0.0.1
+  - name: spine2
+    loopback: 10.0.0.2
+
+# STARTING SMALL: two leaves, not four. 6 cores is the binding constraint, so we
+# build the smallest thing that is still a real fabric and grow into it.
+# Adding leaf3/leaf4 later means appending two entries here and re-running the
+# build -- no existing leaf is touched, no re-cabling. That is the whole point of
+# spine-leaf, and proving it is worth more than running four leaves on day one.
+leaves:
+  - name: leaf1
+    loopback: 10.0.0.11
+  - name: leaf2
+    loopback: 10.0.0.12
+  # - name: leaf3
+  #   loopback: 10.0.0.13
+  # - name: leaf4
+  #   loopback: 10.0.0.14
+
+# Every leaf uplinks to every spine -- full bipartite mesh, the point of the design.
+# /31 assignment is computed, not hand-written: p2p_net + (spine_index, leaf_index).
+
+vlans:
+  - id: 10
+    name: app
+    subnet: 10.10.10.0/24
+    gateway: 10.10.10.1      # anycast SVI on every leaf in Phase 2
+  - id: 20
+    name: db
+    subnet: 10.10.20.0/24
+    gateway: 10.10.20.1
+  - id: 30
+    name: mgmt
+    subnet: 10.10.30.0/24
+    gateway: 10.10.30.1
+
+# One server per VLAN, on different leaves -- deliberately. srv-app1 pinging
+# srv-db1 has to leave leaf1, cross a spine, and be routed into VLAN 20 at leaf2.
+# That single ping exercises the access port, the SVI, OSPF, ECMP across both
+# spines, and inter-VLAN routing. Two more servers would prove nothing new.
+servers:
+  - name: srv-app1
+    leaf: leaf1
+    vlan: 10
+    ip: 10.10.10.11/24
+  - name: srv-db1
+    leaf: leaf2
+    vlan: 20
+    ip: 10.10.20.11/24
+
+# The jump server straddles two worlds: bridged onto the home LAN so you can SSH to
+# it from any device, and into the fabric so Ansible can reach every node.
+#
+# Two interfaces, two jobs:
+#   eth0 -> leaf1 access port on VLAN 30, so Ansible can reach every switch
+#   eth1 -> external connector "System Bridge" (bridge0, forwarding BRIDGE on eth0),
+#           landing directly on the home LAN so you can SSH in from your phone
+#
+# The external address is STATIC and deliberately outside the router's DHCP pool --
+# a lab box whose address moves is a lab box you cannot ssh to reliably. Verified
+# unused before assignment.
+#
+# bridge0 is 'protected' on this controller, which is what keeps a misconfigured
+# lab node from leaking DHCP or STP onto the real network. That mitigation is why
+# bridged is a defensible choice here rather than a reckless one.
+jump_server:
+  enabled: true
+  name: jump
+  leaf: leaf1
+  vlan: 30
+  fabric_ip: 10.10.30.10/24
+  external: true
+  external_mode: bridged
+  external_connector: "System Bridge"   # bridge0 -- VERIFIED via the API
+  external_ip: 192.168.2.50/24
+  external_gateway: 192.168.2.1
