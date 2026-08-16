@@ -20,7 +20,10 @@
 
 set -uo pipefail
 
-ENV_FILE="$HOME/.cml.env"
+# Every credential file whose values must never reach a commit. Add to this list
+# whenever the lab grows a new one -- .grafana.env arrived with the monitoring
+# stack, and a Grafana push token is exactly as damaging to leak as the CML login.
+ENV_FILES=("$HOME/.cml.env" "$HOME/.grafana.env")
 fail=0
 
 # --- rule 1: filenames that must never be committed -------------------------
@@ -46,24 +49,28 @@ while IFS= read -r f; do
 done <<< "$staged"
 
 # --- rule 2: the actual secret values, wherever they appear -----------------
-if [ -r "$ENV_FILE" ]; then
-    diff_content="$(git diff --cached -U0 --no-color)"
+diff_content="$(git diff --cached -U0 --no-color)"
+for ENV_FILE in "${ENV_FILES[@]}"; do
+    if [ ! -r "$ENV_FILE" ]; then
+        echo "  note: $ENV_FILE unreadable -- value scan skipped for it" >&2
+        continue
+    fi
     while IFS='=' read -r key value || [ -n "${key:-}" ]; do
         case "$key" in ''|\#*) continue ;; esac
         value="${value%\"}" ; value="${value#\"}"
         value="${value%\'}" ; value="${value#\'}"
         # Short or boolean values match everything and prove nothing.
         [ "${#value}" -lt 8 ] && continue
-        case "$value" in change-me|true|false) continue ;; esac
+        # Placeholders are not secrets; matching them blocks legitimate commits.
+        case "$value" in change-me|true|false|PASTE_*) continue ;; esac
         if printf '%s' "$diff_content" | grep -qF -- "$value"; then
-            # Name the key, never echo the value -- this output may be pasted.
-            echo "  BLOCKED  the value of $key from ~/.cml.env is in the staged diff"
+            # Name the key and its file, never echo the value -- this output may
+            # be pasted into a chat or an issue.
+            echo "  BLOCKED  the value of $key from ${ENV_FILE/#$HOME/\~} is in the staged diff"
             fail=1
         fi
     done < "$ENV_FILE"
-else
-    echo "  note: $ENV_FILE unreadable -- value scan skipped, filename rules applied" >&2
-fi
+done
 
 if [ "$fail" -ne 0 ]; then
     echo

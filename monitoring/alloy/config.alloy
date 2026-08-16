@@ -1,0 +1,73 @@
+// Grafana Alloy: scrape the Pi and the CML exporter, ship to Grafana Cloud.
+//
+// Credentials are NOT in this file. They come from ~/.grafana.env, which the
+// systemd unit loads as an EnvironmentFile. That file is chmod 600 and matches
+// the *.env rule already in .gitignore, so this config is safe to commit.
+//
+// Scrape interval is 60s everywhere on purpose. Grafana Cloud's free tier is
+// sized by active series at 1 data point per minute; scraping faster multiplies
+// what the tier counts against you and buys nothing for a lab.
+
+// ---------------------------------------------------------------- the Pi ----
+
+prometheus.exporter.unix "pi" {
+  // A deliberately short list. The full default set is ~1000 series of mostly
+  // kernel trivia; these are the ones that explain a slow or wedged Pi.
+  set_collectors = [
+    "cpu", "loadavg", "meminfo", "filesystem",
+    "diskstats", "netdev", "uname", "thermal_zone",
+  ]
+
+  filesystem {
+    // Ignore the pseudo-filesystems; only real storage matters here.
+    fs_types_exclude = "^(autofs|binfmt_misc|cgroup.*|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|overlay|proc|procfs|pstore|securityfs|sysfs|tracefs)$"
+  }
+}
+
+prometheus.scrape "pi" {
+  targets = prometheus.exporter.unix.pi.targets
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "60s"
+  job_name        = "pi"
+}
+
+// --------------------------------------------------------------- the lab ----
+
+prometheus.scrape "cml" {
+  targets = [{
+    __address__ = "127.0.0.1:9639",
+    instance    = "cml-01",
+  }]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "60s"
+  // A cold CML API can take several seconds to answer; don't clip it.
+  scrape_timeout  = "30s"
+  job_name        = "cml"
+}
+
+// ------------------------------------------------------------- ship it out --
+
+prometheus.remote_write "grafana_cloud" {
+  external_labels = {
+    site = "home-lab",
+  }
+
+  endpoint {
+    url = sys.env("GRAFANA_PROM_URL")
+
+    basic_auth {
+      username = sys.env("GRAFANA_PROM_USER")
+      password = sys.env("GRAFANA_PROM_TOKEN")
+    }
+
+    // The lab's uplink is a home connection and CML gets power-cycled; buffer
+    // through short outages instead of dropping samples on the floor.
+    queue_config {
+      capacity         = 10000
+      max_shards       = 3
+      min_backoff      = "30ms"
+      max_backoff      = "5s"
+      retry_on_http_429 = true
+    }
+  }
+}

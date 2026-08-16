@@ -5,3 +5,4 @@ netaddr
 jinja2
 rich
 pyyaml
+prometheus_client

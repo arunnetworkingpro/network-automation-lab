@@ -1,0 +1,22 @@
+[Unit]
+Description=Grafana Alloy - ships lab metrics to Grafana Cloud
+After=network-online.target cml-exporter.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Grafana Cloud URL, instance ID and API token. chmod 600, never committed.
+EnvironmentFile=%h/.grafana.env
+ExecStart=%h/.local/bin/alloy run \
+    --storage.path=%h/.local/share/alloy \
+    --server.http.listen-addr=127.0.0.1:12345 \
+    %h/Project/cml-datacenter/monitoring/alloy/config.alloy
+
+Restart=always
+RestartSec=15
+
+NoNewPrivileges=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target
