@@ -80,6 +80,41 @@ interface Vlan{{ v.id }}
  no shutdown
 !
 {% endfor %}
+{% if evpn_vlans %}
+! ---- Phase 2: EVPN / VXLAN --------------------------------------------------
+!
+! This leaf is a VTEP. The spines are not -- they reflect the routes and never
+! terminate a tunnel.
+!
+l2vpn evpn
+ replication-type {{ overlay.replication }}
+!
+{% for v in evpn_vlans %}
+! VLAN {{ v.id }} -> VNI {{ v.vni }}. Route targets are auto-derived (evi-id based),
+! which is safe here precisely because every switch is in one AS: the RT both sides
+! compute is identical, so there is nothing to keep in sync by hand.
+l2vpn evpn instance {{ v.evi }} vlan-based
+ encapsulation vxlan
+ replication-type {{ overlay.replication }}
+!
+vlan configuration {{ v.id }}
+ member evpn-instance {{ v.evi }} vni {{ v.vni }}
+!
+{% endfor %}
+! One tunnel interface carries every VNI. Sourcing it from Loopback0 is what makes
+! the overlay inherit the underlay's ECMP -- the tunnel follows whichever spine
+! OSPF prefers, and survives losing one.
+interface nve1
+ no shutdown
+ source-interface Loopback0
+ ! Peers are learned from BGP rather than configured. Adding a leaf changes no
+ ! existing leaf's config, which is the same O(1) property the underlay has.
+ host-reachability protocol bgp
+{% for v in evpn_vlans %}
+ member vni {{ v.vni }} ingress-replication
+{% endfor %}
+!
+{% endif %}
 router ospf 1
  router-id {{ loopback }}
  passive-interface Loopback0
@@ -106,6 +141,18 @@ router bgp {{ asn }}
   neighbor {{ s }} activate
 {% endfor %}
  exit-address-family
+{% if evpn_vlans %}
+ !
+ ! Note there is no 'network' statement here and no redistribution: EVPN routes are
+ ! originated from what the leaf learns on its access ports. A MAC appearing on
+ ! Et1/1 becomes a type-2 advertisement on its own.
+ address-family l2vpn evpn
+  neighbor SPINES send-community both
+{% for s in spines %}
+  neighbor {{ s }} activate
+{% endfor %}
+ exit-address-family
+{% endif %}
 !
 {% if static_routes %}
 ! Return path. Traffic from the home LAN arrives via the jump server; without a

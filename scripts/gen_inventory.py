@@ -117,6 +117,14 @@ def main() -> None:
                 "spine_loopbacks": [s["loopback"] for s in topo["spines"]],
                 "leaf_loopbacks": [l["loopback"] for l in topo["leaves"]],
                 "expected_ospf_neighbors": len(topo["leaves"]),
+                # Phase 2. The overlay assertions skip themselves when this is
+                # false, so validate.yml stays correct on a Phase 1 fabric.
+                "overlay_enabled": bool((topo.get("overlay") or {}).get("enabled")),
+                "stretched_vlans": sorted((topo.get("overlay") or {}).get("stretched", [])),
+                "stretched_vnis": [
+                    (topo.get("overlay") or {}).get("vni_base", 0) + v
+                    for v in sorted((topo.get("overlay") or {}).get("stretched", []))
+                ],
             },
         }
     }

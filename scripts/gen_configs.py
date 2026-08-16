@@ -104,6 +104,16 @@ def main() -> None:
     asn = topo["underlay"]["bgp_asn"]
     area = topo["underlay"]["ospf_area"]
     vlans = {v["id"]: v for v in topo["vlans"]}
+
+    # Phase 2 overlay. Absent or disabled and every template falls back to the
+    # Phase 1 config exactly as it was -- the EVPN blocks are guarded, not merged in.
+    overlay = topo.get("overlay") or {}
+    if not overlay.get("enabled"):
+        overlay = {}
+    stretched = sorted(overlay.get("stretched", [])) if overlay else []
+    for v in stretched:
+        if v not in vlans:
+            sys.exit(f"overlay.stretched lists VLAN {v}, which is not in vlans:")
     spine_names = [s["name"] for s in topo["spines"]]
     leaf_names = [l["name"] for l in topo["leaves"]]
     spine_lo = [s["loopback"] for s in topo["spines"]]
@@ -131,6 +141,7 @@ def main() -> None:
             asn=asn,
             links=sorted(uplinks, key=lambda x: x["intf"]),
             clients=leaf_lo,
+            overlay=overlay,
         )
 
     # --- leaves ------------------------------------------------------------
@@ -155,6 +166,21 @@ def main() -> None:
                     {"intf": near["interface"], "host": far["node"], "vlan": vlan}
                 )
                 local_vlans.add(vlan)
+
+        # A stretched VLAN exists on every leaf, whether or not a host sits on this
+        # one -- an overlay whose VLANs only appear where a host already is would be
+        # pointless. It gets the VLAN, the EVPN instance and the VNI; it does not get
+        # an SVI, because the anycast gateway is Phase 2b.
+        l2_vlans = sorted(local_vlans | set(stretched))
+        evpn_vlans = [
+            {
+                "id": v,
+                "name": vlans[v]["name"],
+                "evi": v,
+                "vni": overlay["vni_base"] + v,
+            }
+            for v in stretched
+        ]
 
         # An SVI only where a host in that VLAN actually lives -- see leaf.j2.
         svis = [
@@ -223,13 +249,15 @@ def main() -> None:
             loopback=leaf["loopback"],
             area=area,
             asn=asn,
-            vlans=[vlans[v] for v in sorted(local_vlans)],
+            vlans=[vlans[v] for v in l2_vlans],
             uplinks=sorted(uplinks, key=lambda x: x["intf"]),
             access_ports=sorted(access, key=lambda x: x["intf"]),
             svis=svis,
             networks=networks,
             spines=spine_lo,
             static_routes=static_routes,
+            overlay=overlay,
+            evpn_vlans=evpn_vlans,
         )
 
     # --- servers -----------------------------------------------------------

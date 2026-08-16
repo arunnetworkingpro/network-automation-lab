@@ -71,9 +71,66 @@
         fail_msg: "{{ inventory_hostname }} is not peering in AS {{ bgp_asn }}"
       when: inventory_hostname in groups['leaves']
 
+    # ---- Phase 2: the overlay -------------------------------------------------
+    # These skip themselves entirely when overlay.enabled is false, so this
+    # playbook stays correct against a Phase 1 fabric.
+
+    - name: Collect EVPN state
+      cisco.ios.ios_command:
+        commands:
+          - show bgp l2vpn evpn summary
+          - show nve vni
+      register: evpn
+      when: overlay_enabled
+
+    - name: The EVPN address-family is up on every session
+      ansible.builtin.assert:
+        that:
+          - "'Idle' not in afi"
+          - "'Active' not in afi"
+          - "'Connect' not in afi"
+          - afi is search('65000')
+        success_msg: "l2vpn evpn address-family established"
+        fail_msg: >-
+          {{ inventory_hostname }} has no healthy l2vpn evpn session. The usual
+          cause is a missing 'send-community both' -- the session comes up and
+          every route is then discarded for having no importable route target.
+      vars:
+        afi: "{{ evpn.stdout[0] }}"
+      when: overlay_enabled
+
+    # Deliberately asserts the VNI is Up rather than that an NVE peer exists. A
+    # leaf with no local port in a stretched VLAN originates no type-3 route, so
+    # its peer never forms -- correct behaviour that a peer-count check would
+    # report as a fault.
+    - name: Every stretched VNI is up on every leaf
+      ansible.builtin.assert:
+        that: evpn.stdout[1] is search(item | string + '\s+\S+\s+Up')
+        success_msg: "VNI {{ item }} up"
+        fail_msg: >-
+          VNI {{ item }} is not Up on {{ inventory_hostname }} --
+          check 'interface nve1' and the vlan configuration stanza
+      loop: "{{ stretched_vnis }}"
+      when:
+        - overlay_enabled
+        - inventory_hostname in groups['leaves']
+
+    - name: A spine reflects EVPN for every leaf, and terminates no tunnel
+      ansible.builtin.assert:
+        that:
+          - evpn.stdout[1] is not search('nve1')
+        success_msg: "spine reflects EVPN without being a VTEP"
+        fail_msg: >-
+          {{ inventory_hostname }} has an NVE interface. A spine should reflect
+          EVPN routes and never terminate a VXLAN tunnel.
+      when:
+        - overlay_enabled
+        - inventory_hostname in groups['spines']
+
     - name: Report
       ansible.builtin.debug:
         msg: >-
           {{ inventory_hostname }} ({{ ansible_host }}):
           {{ state.stdout[0] | regex_findall('FULL') | length }} OSPF neighbors,
-          BGP in AS {{ bgp_asn }}, underlay healthy
+          BGP in AS {{ bgp_asn }}, underlay healthy{{
+            ', EVPN up' if overlay_enabled else '' }}

@@ -47,6 +47,28 @@ leaves:
 # Every leaf uplinks to every spine -- full bipartite mesh, the point of the design.
 # /31 assignment is computed, not hand-written: p2p_net + (spine_index, leaf_index).
 
+# PHASE 2: BGP EVPN / VXLAN overlay on the Phase 1 cabling.
+#
+# Viability was settled by probing the running nodes, not by reading a datasheet:
+# both IOL images are IOS-XE 17.16.1a ADVENTERPRISEK9 and answer 'show bgp l2vpn
+# evpn', 'show nve peers' and 'show l2vpn evpn summary'. So this stays on IOL --
+# no NX-OSv, and the fabric does not have to shrink.
+#
+# Ingress replication rather than underlay multicast for BUM traffic. Multicast is
+# closer to a large real DC, but with two leaves it is a great deal of machinery to
+# carry for no observable difference.
+#
+# 'stretched' is the list of VLANs that exist on EVERY leaf rather than only where
+# a host happens to live -- that is the whole point of the overlay. A stretched
+# VLAN still gets an SVI only where a host lives, because until Phase 2b brings up
+# the distributed anycast gateway, a second copy of 10.10.10.1 is a duplicate
+# address, not a redundant one.
+overlay:
+  enabled: true
+  vni_base: 10000        # VNI = vni_base + vlan id, so 10 -> 10010 and stays readable
+  replication: ingress
+  stretched: [10]
+
 vlans:
   - id: 10
     name: app

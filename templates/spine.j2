@@ -52,6 +52,23 @@ router bgp {{ asn }}
   neighbor {{ c }} activate
 {% endfor %}
  exit-address-family
+{% if overlay %}
+ !
+ ! Phase 2. The spine reflects EVPN routes and still holds no VLAN, no SVI and no
+ ! VNI -- it never learns a tenant MAC, it only passes the advertisements around.
+ ! That is the property that keeps a spine cheap as the fabric grows.
+ !
+ ! 'send-community both' is not optional here: EVPN carries its route targets in
+ ! extended communities, so without it the leaves exchange routes that every
+ ! receiver then discards for having no importable RT.
+ address-family l2vpn evpn
+  neighbor LEAVES send-community both
+  neighbor LEAVES route-reflector-client
+{% for c in clients %}
+  neighbor {{ c }} activate
+{% endfor %}
+ exit-address-family
+{% endif %}
 !
 ip ssh version 2
 line vty 0 4
