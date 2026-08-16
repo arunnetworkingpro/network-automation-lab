@@ -82,8 +82,10 @@ scripts/verify.py          the check ladder, run from the jump box
 scripts/lab_up.py          bring the fabric back after a power cycle, unattended
 scripts/lab_up_boot.sh     what @reboot cron runs: paths, logging, exit code
 cml/client.py              authenticated CML client
+monitoring/                the metrics stack: exporter, Alloy config, dashboards
 docs/design.md             the design, the tradeoffs, and every gotcha found
 docs/inventory.md          every device, address and cable, and how to reach it
+docs/monitoring.md         what is collected, and the rule the exporter must not break
 ```
 
 `link-map.yml` matters more than it looks. It records the interface labels the
@@ -118,7 +120,7 @@ git config core.hooksPath .githooks
 
 `.githooks/pre-commit` refuses any commit that stages `configs/`, an `*.env`, or a
 generated inventory — and, separately, any commit whose diff contains a value from
-`~/.cml.env`, wherever it appears.
+`~/.cml.env` or `~/.grafana.env`, wherever it appears.
 
 The second rule is the one that earns its keep. GitHub's push protection matches
 known credential *formats*; `LAB_DEVICE_PASS` is `secrets.token_urlsafe(12)`, a
@@ -246,6 +248,75 @@ This also means the home-router static route alone will not give the phone and l
 direct fabric access. Reaching the fabric means going through the jump — `ssh` to
 `192.168.2.50` and work from there.
 
+## Monitoring
+
+CML has no Prometheus endpoint. It does have a REST API that reports the one thing
+this lab is built around, so `monitoring/cml_exporter.py` turns that API into
+metrics and Grafana Cloud draws them:
+
+```
+CML ──HTTPS, read-only──> cml_exporter.py ──:9639──> Alloy ──remote_write──> Grafana Cloud
+                                                       ↑
+                                                  node_exporter (the Pi)
+```
+
+Outbound only. The exporter binds loopback, Alloy's UI binds loopback, and nothing
+accepts an inbound connection — the lab is not exposed by being monitored.
+
+The headline is `cml_compute_cpu_predicted / cml_compute_cpu_count`: what CML thinks
+the running nodes need, over what the i5-8500T actually has. It sits around **2.5×**,
+and drifts between 11 and 25 predicted cores as nodes settle. That number is the
+reason `leaf3` and `leaf4` are still commented out, and it is now measured rather
+than asserted. Memory, for contrast, never exceeds 5 GB of 20 — the constraint really
+is cores.
+
+### The rule the exporter must not break
+
+A node's `configuration` field contains the rendered config, and those embed the
+device password in cleartext — the same reason `configs/` is gitignored. So the
+exporter never reads a node payload without `exclude_configurations=true`. Every
+endpoint it touches is secret-free by construction, and the property is worth
+re-checking after any change:
+
+```bash
+curl -s localhost:9639/metrics | grep -ci 'secret\|password'   # must print 0
+```
+
+Closing that door in the repo and leaving it open in the metrics would be a strange
+way to lose the password.
+
+### Running it
+
+Both are user services — no root anywhere, which is the whole reason they are user
+services rather than the system units they look like they should be:
+
+```bash
+cp monitoring/cml-exporter.service monitoring/alloy.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now cml-exporter alloy
+sudo loginctl enable-linger arun        # the one root step: survive logout
+```
+
+Grafana Cloud's URL, instance ID and token live in `~/.grafana.env` at 0600, read
+via `sys.env()` — so `config.alloy` carries no secret and commits safely.
+`monitoring/start_shipping.sh` validates that file before starting anything, and
+reports what is wrong without ever echoing the token.
+
+### Dashboards
+
+Generated, like everything else here:
+
+```bash
+.venv/bin/python monitoring/gen_dashboards.py    # -> monitoring/dashboards/*.json
+```
+
+Import via **Dashboards → New → Import**. Series colours are pinned per entity in
+the generator, so filtering out `leaf2` cannot repaint `spine1`, and the eight-slot
+order is a colourblind-safety property rather than decoration — extend
+`NODE_ORDER` / `LINK_ORDER` by appending, never by re-ordering.
+
+Both scrapes run at 60s on purpose: the free tier is sized at one data point per
+minute, and 134 CML series plus 281 from the Pi leaves most of the 10,000 spare.
+
 ## Next
 
 - Push device config with Ansible, replacing `gen_configs.py --push` for day-2 changes
@@ -258,3 +329,10 @@ direct fabric access. Reaching the fabric means going through the jump — `ssh`
   peering forms in both directions, and a ping actually crosses the tunnel. Until that
   passes, the overlay is configured but not proven end to end.
 - Phase 2b: distributed anycast gateway
+- **Monitoring — built, not yet shipping.** The exporter, the Alloy config and both
+  dashboards are verified locally: components healthy, 134 metrics served, every
+  dashboard query resolved against live output. What is missing is the Grafana Cloud
+  push token, so nothing has reached Grafana yet and the dashboards have no data
+  behind them. Built and proven are not the same thing.
+- Alert on the capacity ceiling rather than reading it: `cpu_predicted` crossing
+  `cpu_count`, and any node whose RAM sits at its allocation — `jump` already does
