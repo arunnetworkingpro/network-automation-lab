@@ -80,6 +80,7 @@ scripts/gen_configs.py     render day-0 configs, optionally push them
 scripts/bootstrap_ssh.py   generate SSH host keys over telnet
 scripts/verify.py          the check ladder, run from the jump box
 scripts/lab_up.py          bring the fabric back after a power cycle, unattended
+scripts/lab_up_boot.sh     what @reboot cron runs: paths, logging, exit code
 cml/client.py              authenticated CML client
 docs/design.md             the design, the tradeoffs, and every gotcha found
 docs/inventory.md          every device, address and cable, and how to reach it
@@ -121,7 +122,17 @@ and re-bootstraps any SSH host key that did not survive:
 ```
 
 It is safe to run at any time — on an already-running fabric it does nothing and
-exits 0, which is what makes it usable from `@reboot` cron.
+exits 0, which is what makes it usable from `@reboot` cron. It is installed there
+on the Pi, via a wrapper that keeps the absolute paths and logging out of the
+crontab line:
+
+```bash
+@reboot /home/arun/Project/cml-datacenter/scripts/lab_up_boot.sh
+tail -f ~/lab_up.log        # watch a boot, or read the last one
+```
+
+Nothing gates on the Pi and the CML server booting in any particular order: the
+controller wait is 15 minutes of retries, so whichever comes up second is fine.
 
 Two things measured while testing it, both of which shape how it waits. CML's
 `STARTED` means only that the node process is running, so the readiness gate gates
