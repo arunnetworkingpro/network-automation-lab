@@ -1,4 +1,4 @@
-# network
+# Network Automation Lab
 
 A small Ethernet data center, built in Cisco CML and driven entirely from code.
 
@@ -249,4 +249,12 @@ direct fabric access. Reaching the fabric means going through the jump — `ssh`
 ## Next
 
 - Push device config with Ansible, replacing `gen_configs.py --push` for day-2 changes
-- Phase 2: BGP EVPN / VXLAN on the same cabling — pending whether `iol-xe` supports it
+- **Phase 2a — built:** BGP EVPN / VXLAN overlay on the same cabling, VLAN 10 stretched
+  across both leaves. The open question above is settled: both IOL images run IOS-XE
+  17.16.1a `ADVENTERPRISEK9` and carry the full EVPN stack, so the fabric did not have to
+  shrink to fit NX-OSv. One wrinkle worth knowing — `ioll2-xe` reports EVPN *Vlans*
+  (VLAN-based service) where `iol-xe` reports *Bridge Domains*, and that shapes the config.
+- **In progress:** a second VLAN 10 host on leaf2, so leaf2 originates a type-3 route, NVE
+  peering forms in both directions, and a ping actually crosses the tunnel. Until that
+  passes, the overlay is configured but not proven end to end.
+- Phase 2b: distributed anycast gateway
