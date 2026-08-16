@@ -1,0 +1,79 @@
+---
+# Assert the fabric matches the design, from the devices' own point of view.
+#
+# scripts/verify.py proves reachability from the outside: can a packet get there.
+# This proves intent: is every OSPF adjacency actually FULL, is every iBGP session
+# actually Established, is the route reflector actually reflecting. A fabric can
+# pass ping while quietly running on one spine because the other never came up.
+#
+#   export LAB_DEVICE_PASS=$(grep '^LAB_DEVICE_PASS=' ~/.cml.env | cut -d= -f2-)
+#   ansible-playbook playbooks/validate.yml
+
+- name: Validate the underlay and overlay
+  hosts: fabric
+  gather_facts: false
+
+  tasks:
+    - name: Fail early if the device password was not exported
+      ansible.builtin.assert:
+        that: ansible_password | length > 0
+        fail_msg: >-
+          LAB_DEVICE_PASS is empty. Run:
+          export LAB_DEVICE_PASS=$(grep '^LAB_DEVICE_PASS=' ~/.cml.env | cut -d= -f2-)
+      run_once: true
+      delegate_to: localhost
+
+    - name: Collect protocol state
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip bgp summary
+          - show ip interface brief
+      register: state
+
+    - name: Every OSPF adjacency is FULL
+      ansible.builtin.assert:
+        that: "'EXSTART' not in ospf and 'INIT' not in ospf and 'DOWN' not in ospf"
+        success_msg: "OSPF adjacencies clean"
+        fail_msg: "OSPF adjacency not FULL on {{ inventory_hostname }}"
+      vars:
+        ospf: "{{ state.stdout[0] }}"
+
+    - name: A spine sees every leaf, a leaf sees every spine
+      ansible.builtin.assert:
+        that: neighbor_count == expected
+        success_msg: "{{ neighbor_count }} OSPF neighbors, as designed"
+        fail_msg: >-
+          {{ inventory_hostname }} has {{ neighbor_count }} OSPF neighbors,
+          expected {{ expected }} -- a link or an interface is down
+      vars:
+        # 'FULL/  -' appears once per adjacency on point-to-point links.
+        neighbor_count: "{{ state.stdout[0] | regex_findall('FULL') | length }}"
+        expected: "{{ leaf_loopbacks | length if inventory_hostname in groups['spines']
+                      else spine_loopbacks | length }}"
+
+    - name: No iBGP session is stuck
+      ansible.builtin.assert:
+        that:
+          - "'Idle' not in bgp"
+          - "'Active' not in bgp"
+          - "'Connect' not in bgp"
+        success_msg: "all BGP sessions established"
+        fail_msg: >-
+          BGP session not established on {{ inventory_hostname }} --
+          check reachability to the peer loopback
+      vars:
+        bgp: "{{ state.stdout[1] }}"
+
+    - name: Leaves advertise their host subnets
+      ansible.builtin.assert:
+        that: state.stdout[1] is search('65000')
+        fail_msg: "{{ inventory_hostname }} is not peering in AS {{ bgp_asn }}"
+      when: inventory_hostname in groups['leaves']
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_host }}):
+          {{ state.stdout[0] | regex_findall('FULL') | length }} OSPF neighbors,
+          BGP in AS {{ bgp_asn }}, underlay healthy

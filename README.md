@@ -153,7 +153,46 @@ unconfigured, check whether the config was *accepted* before debugging the netwo
 `show run` is the fast test — if what you sent is not in there, nothing downstream of
 it is real.
 
+## Ansible
+
+Inventory is generated, not written — `scripts/gen_inventory.py` reads the same
+topology everything else does, so adding a leaf never means editing a host list.
+No password is stored in it; `ansible_password` resolves from the environment at
+run time, which keeps the inventory safe to read and paste.
+
+```bash
+./scripts/run_ansible.sh playbooks/validate.yml
+./scripts/run_ansible.sh playbooks/validate.yml --limit leaves
+```
+
+`validate.yml` asserts *intent* rather than reachability: every OSPF adjacency FULL,
+every iBGP session Established, the right neighbor count per role. A fabric can pass
+ping while quietly running on one spine because the other never came up — that is
+what this catches and `verify.py` cannot.
+
+### Why Ansible runs on the jump box
+
+CML's external connector is `protected` and `snooped`. It drops frames whose source
+or destination is not the attached node's own address, which is exactly what routing
+*through* the jump requires. Measured, not guessed:
+
+| test | result |
+|---|---|
+| jump → Pi, source `192.168.2.50` | works |
+| jump → Pi, source `10.10.30.10` | dropped |
+| Pi → fabric, with a static route in place | dropped |
+| leaf1 → Pi | dropped, though leaf1 → jump works |
+
+A static route on the Pi (or the home router) is **necessary but not sufficient**;
+clearing `protected` and `snooped` on the connector and restarting the node did not
+lift it either. So `run_ansible.sh` syncs to the jump and runs there. The jump has
+direct fabric access and a real path to the LAN, which is the whole reason it exists.
+
+This also means the home-router static route alone will not give the phone and laptop
+direct fabric access. Reaching the fabric means going through the jump — `ssh` to
+`192.168.2.50` and work from there.
+
 ## Next
 
-- Ansible layer, inventory generated from `link-map.yml`
+- Push device config with Ansible, replacing `gen_configs.py --push` for day-2 changes
 - Phase 2: BGP EVPN / VXLAN on the same cabling — pending whether `iol-xe` supports it
