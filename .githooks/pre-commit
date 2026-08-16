@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Refuse to commit a lab credential, or a file that is known to embed one.
+#
+# GitHub's push protection matches known credential *formats* -- AWS keys, GitHub
+# tokens, and so on. LAB_DEVICE_PASS is secrets.token_urlsafe(12): a random string
+# with no recognisable shape, so that scanner will not catch it. This hook does,
+# because it does not guess what a secret looks like -- it reads the real values
+# out of ~/.cml.env and searches the staged diff for those exact strings.
+#
+# Two independent rules, either of which blocks the commit:
+#   1. filename  -- configs/, *.env, generated inventory: never committable
+#   2. content   -- any value from ~/.cml.env appearing in the staged diff
+#
+# Rule 1 duplicates .gitignore on purpose. .gitignore is one line away from being
+# wrong, and it is the only thing standing between this repo and a cleartext
+# device password.
+#
+# Installed by:  git config core.hooksPath .githooks
+# Bypassed by:   git commit --no-verify   (don't)
+
+set -uo pipefail
+
+ENV_FILE="$HOME/.cml.env"
+fail=0
+
+# --- rule 1: filenames that must never be committed -------------------------
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        example.env)
+            : ;;                      # the placeholder is meant to be tracked
+        configs/*)
+            echo "  BLOCKED  $f"
+            echo "           rendered configs embed the device password in cleartext"
+            fail=1 ;;
+        *.env|.cml.env)
+            echo "  BLOCKED  $f"
+            echo "           env files hold real credentials"
+            fail=1 ;;
+        ansible/inventory/generated_*)
+            echo "  BLOCKED  $f"
+            echo "           generated inventory -- rebuild it with gen_inventory.py"
+            fail=1 ;;
+    esac
+done <<< "$staged"
+
+# --- rule 2: the actual secret values, wherever they appear -----------------
+if [ -r "$ENV_FILE" ]; then
+    diff_content="$(git diff --cached -U0 --no-color)"
+    while IFS='=' read -r key value || [ -n "${key:-}" ]; do
+        case "$key" in ''|\#*) continue ;; esac
+        value="${value%\"}" ; value="${value#\"}"
+        value="${value%\'}" ; value="${value#\'}"
+        # Short or boolean values match everything and prove nothing.
+        [ "${#value}" -lt 8 ] && continue
+        case "$value" in change-me|true|false) continue ;; esac
+        if printf '%s' "$diff_content" | grep -qF -- "$value"; then
+            # Name the key, never echo the value -- this output may be pasted.
+            echo "  BLOCKED  the value of $key from ~/.cml.env is in the staged diff"
+            fail=1
+        fi
+    done < "$ENV_FILE"
+else
+    echo "  note: $ENV_FILE unreadable -- value scan skipped, filename rules applied" >&2
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo
+    echo "Commit refused. Unstage the offending change:"
+    echo "    git restore --staged <file>"
+    echo
+    echo "If a secret is already written into a tracked file, remove the value"
+    echo "itself -- unstaging alone leaves it on disk for the next 'git add -A'."
+    exit 1
+fi
+
+exit 0

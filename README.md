@@ -110,6 +110,26 @@ thing. Re-run `bootstrap_ssh.py` afterwards — a wipe takes the SSH host key wi
 Credentials live only in `~/.cml.env`, chmod 600, never in this repo. Rendered
 configs are gitignored: they embed the device password in cleartext.
 
+### Keeping secrets out — enable this on a fresh clone
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` refuses any commit that stages `configs/`, an `*.env`, or a
+generated inventory — and, separately, any commit whose diff contains a value from
+`~/.cml.env`, wherever it appears.
+
+The second rule is the one that earns its keep. GitHub's push protection matches
+known credential *formats*; `LAB_DEVICE_PASS` is `secrets.token_urlsafe(12)`, a
+random string with no recognisable shape, so that scanner will not flag it. This
+hook does not guess what a secret looks like — it reads the real values and greps
+for them.
+
+The filename rule deliberately duplicates `.gitignore`. That one `configs/` line is
+the only thing standing between this repo and a cleartext device password, and a
+single careless edit to it is a bad way to find that out.
+
 ### After a power cycle
 
 CML does not auto-start labs — when the server reboots, every node comes back
