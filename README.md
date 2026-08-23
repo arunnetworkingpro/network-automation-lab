@@ -176,7 +176,11 @@ rung depends on the one below, so the first failure names the broken layer:
 5. jump -> internet           does the bridge reach the modem?
 ```
 
-Current state: **8 passed, 0 failed.**
+Current state: **7 passed, 1 failed** — `srv-app1` (VLAN 10, on `leaf1`) is not
+answering yet after the most recent full lab restart; every other host, including
+its VLAN 20 counterpart `srv-db1` on `leaf2`, passes. Open, not yet root-caused —
+suspect a DHCP-lease timing issue on that leaf rather than the fabric itself, since
+OSPF/BGP and every other reachability check pass clean.
 
 ---
 
@@ -319,6 +323,20 @@ minute, and 134 CML series plus 281 from the Pi leaves most of the 10,000 spare.
 
 ## Next
 
+- **Passwordless SSH — shipped.** `LAB_ADMIN_SSH_PUBKEY` in `~/.cml.env` (optional,
+  a public key rather than a secret) flows into every host that has somewhere to put
+  it: `ssh_authorized_keys` via cloud-init on `jump` and `rdma1`, `ip ssh pubkey-chain`
+  on all four IOS-XE devices (CiscoSSH on 17.16 supports ed25519). Key auth is
+  additive everywhere — password login still works if the key ever mismatches.
+  Alpine (`srv-app1`, `srv-db1`) has no path to take a key at all, same `node.cfg`
+  constraint as everything else about that image, so those two stay password-only.
+  Verified end to end: `ssh spine1` / `ssh leaf1` through the jump host, no prompt.
+- **Monitoring — shipped.** Dashboards and alert rules are provisioned into Grafana
+  Cloud via `push_dashboards.py` / `push_alerts.py` — idempotent HTTP-API pushes,
+  same-uid-updates rather than duplicating on re-run. Alerts (node/link down, CML
+  API unreachable, capacity ceiling) are gated on lab state, so deliberately
+  stopping the lab does not page; both scripts read credentials only from
+  `~/.grafana-api-url` / `~/.grafana-api-token`, never hardcoded.
 - Push device config with Ansible, replacing `gen_configs.py --push` for day-2 changes
 - **Phase 2a — built:** BGP EVPN / VXLAN overlay on the same cabling, VLAN 10 stretched
   across both leaves. The open question above is settled: both IOL images run IOS-XE
@@ -329,10 +347,21 @@ minute, and 134 CML series plus 281 from the Pi leaves most of the 10,000 spare.
   peering forms in both directions, and a ping actually crosses the tunnel. Until that
   passes, the overlay is configured but not proven end to end.
 - Phase 2b: distributed anycast gateway
-- **Monitoring — built, not yet shipping.** The exporter, the Alloy config and both
-  dashboards are verified locally: components healthy, 134 metrics served, every
-  dashboard query resolved against live output. What is missing is the Grafana Cloud
-  push token, so nothing has reached Grafana yet and the dashboards have no data
-  behind them. Built and proven are not the same thing.
+- **RDMA / Soft-RoCE — scaffolded, not solved.** `rdma1` (ubuntu, `leaf2`/VLAN 20) sits
+  deliberately opposite `jump` in the topology, so `ib_send_bw` between the two RoCE
+  hosts crosses `leaf1 → spine → leaf2` and measures the fabric rather than loopback.
+  `ibfabric/` carries the Soft-RoCE (`rdma_rxe`) setup and a fat-tree netlist for a
+  later, bigger topology. Cross-fabric `ib_send_bw` still hangs between the two hosts
+  — parked, not yet root-caused; `sys-2470/` is a captured `/sys/class/infiniband*`
+  dump from that debugging session, kept for whenever this gets picked back up.
+- **Fabric access from off the home LAN — no router static route available.** The
+  ISP modem supports DMZ only, not a static route, and there is no separate router
+  to add one on. So `10.0.0.0/8 via 192.168.2.50` from the design section above is
+  not happening at the router, full stop. Fallback in use instead: SSH ProxyJump
+  through `jump` (`~/.ssh/config`, and the equivalent host-chaining setup in
+  Termius) — needs no router support at all, and every fabric host is reachable as
+  `ssh spine1`, `ssh leaf2`, etc., proxied through jump transparently.
 - Alert on the capacity ceiling rather than reading it: `cpu_predicted` crossing
-  `cpu_count`, and any node whose RAM sits at its allocation — `jump` already does
+  `cpu_count`, and any node whose RAM sits at its allocation — `jump` is the one to
+  watch first, since NAT, forwarding and package installs leave it closer to its
+  2 GB cap than any IOL node gets to its own.
