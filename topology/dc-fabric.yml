@@ -97,6 +97,32 @@ servers:
     vlan: 20
     ip: 10.10.20.11/24
 
+# PHASE 2b: RDMA hosts, for Soft-RoCE (rdma_rxe) over the Ethernet fabric.
+#
+# Ubuntu, not alpine: RoCE needs rdma_rxe out of linux-modules-extra, and the
+# alpine image has no path to it. That costs 2 GB instead of 512 MB per host,
+# which is affordable now -- memory was never the constraint, cores are.
+#
+# Deliberately on leaf2 while jump sits on leaf1, so ib_send_bw between the two
+# crosses leaf1 -> spine -> leaf2 and measures the fabric rather than loopback.
+# VLAN 20 reuses an SVI that already exists and is already in OSPF, so adding a
+# host needs one access-port line on leaf2 and no routing changes.
+#
+# Second NIC bridged to the home LAN, same reasoning as the jump server: these
+# boxes have to reach the Ubuntu archive for the kernel modules, and the fabric
+# has no route out.
+#
+# Soft-RoCE builds every packet in software, so two hosts benchmarking at once
+# is the honest ceiling on six cores. Adding rdma2 means appending here.
+rdma_hosts:
+  - name: rdma1
+    leaf: leaf2
+    vlan: 20
+    fabric_ip: 10.10.20.12/24
+    external: true
+    external_ip: 192.168.2.51/24    # verified unused before assignment
+    external_gateway: 192.168.2.1
+
 # The jump server straddles two worlds: bridged onto the home LAN so you can SSH to
 # it from any device, and into the fabric so Ansible can reach every node.
 #

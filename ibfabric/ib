@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Run any IB tool against the simulated fabric without remembering the shim.
+#
+#     ibfabric/ib sminfo
+#     ibfabric/ib iblinkinfo
+#     ibfabric/ib ibnetdiscover
+#
+# Sourcing ibenv.sh by hand works too, but it has to happen in the same shell as
+# the tool -- which is easy to get wrong from a phone, hence this.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$HERE/ibenv.sh"
+
+[[ $# -gt 0 ]] || { echo "usage: ib <ib-tool> [args]" >&2; exit 2; }
+
+exec "$@"
