@@ -531,7 +531,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * cml_compute_memory_bytes{state=\"used\"} / cml_compute_memory_bytes{state=\"total\"}",
+          "expr": "100 * cml_compute_memory_bytes{state=\"used\"} / ignoring(state) cml_compute_memory_bytes{state=\"total\"}",
           "refId": "A",
           "editorMode": "code"
         }

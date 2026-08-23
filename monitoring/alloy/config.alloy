@@ -24,8 +24,21 @@ prometheus.exporter.unix "pi" {
   }
 }
 
-prometheus.scrape "pi" {
+// prometheus.exporter.unix stamps job="integrations/unix" onto its own targets,
+// and a target label beats the scrape's job_name. Without this rewrite every Pi
+// panel queries job="pi" and comes back empty.
+discovery.relabel "pi" {
   targets = prometheus.exporter.unix.pi.targets
+
+  rule {
+    action       = "replace"
+    target_label = "job"
+    replacement  = "pi"
+  }
+}
+
+prometheus.scrape "pi" {
+  targets = discovery.relabel.pi.output
   forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
   scrape_interval = "60s"
   job_name        = "pi"

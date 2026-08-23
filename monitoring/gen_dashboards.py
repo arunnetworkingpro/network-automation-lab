@@ -42,6 +42,15 @@ MUTED = "#898781"  # axis/annotation ink, and the "this is a limit" reference li
 
 DS = {"type": "prometheus", "uid": "${datasource}"}
 
+# cml_compute_{memory,disk}_bytes carries the used/free/total split in a `state`
+# label, so the two sides of the ratio differ by exactly that label. Without
+# `ignoring(state)` the vector match finds no pairs and the panel is silently
+# empty -- no error, just nothing.
+MEM_USED_PCT = ('100 * cml_compute_memory_bytes{state="used"}'
+                ' / ignoring(state) cml_compute_memory_bytes{state="total"}')
+DISK_USED_PCT = ('100 * cml_compute_disk_bytes{state="used"}'
+                 ' / ignoring(state) cml_compute_disk_bytes{state="total"}')
+
 
 def _thresholds(steps):
     return {
@@ -199,6 +208,86 @@ def bargauge(title, expr, legend, x, y, w, h, unit="percent", steps=None,
     }
 
 
+def table(title, targets, x, y, w, h, transformations, overrides=None,
+          desc=None, sort_by=None):
+    """One row per entity, one column per measure.
+
+    Every target is an instant query reduced with `sum by (...)` so the frame
+    carries only the labels that become columns -- joining raw series drags in
+    job/instance/__name__ and the join field names stop being predictable.
+    """
+    return {
+        "type": "table",
+        "title": title,
+        "description": desc or "",
+        "datasource": DS,
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "targets": targets,
+        "transformations": transformations,
+        "fieldConfig": {
+            "defaults": {
+                # Values wear text ink; a status colour appears only where the
+                # cell also spells the state out in words.
+                "color": {"mode": "thresholds"},
+                "thresholds": _thresholds([("text", None)]),
+                "custom": {
+                    "align": "auto",
+                    "cellOptions": {"type": "auto"},
+                    "filterable": True,
+                    "inspect": False,
+                },
+            },
+            "overrides": overrides or [],
+        },
+        "options": {
+            "showHeader": True,
+            "cellHeight": "sm",
+            "footer": {"show": False, "reducer": ["sum"], "fields": ""},
+            "sortBy": [{"displayName": sort_by, "desc": False}] if sort_by else [],
+        },
+    }
+
+
+def state_timeline(title, targets, x, y, w, h, mappings, desc=None,
+                   overrides=None):
+    """Discrete state over time. Entity names sit on the y axis, so identity is
+    direct-labelled and colour only ever carries the state."""
+    return {
+        "type": "state-timeline",
+        "title": title,
+        "description": desc or "",
+        "datasource": DS,
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "targets": targets,
+        "fieldConfig": {
+            "defaults": {
+                "color": {"mode": "thresholds"},
+                "thresholds": _thresholds([(CRITICAL, None), (GOOD, 1)]),
+                "mappings": mappings,
+                "min": 0,
+                "max": 1,
+                "custom": {
+                    "lineWidth": 2,  # the 2px surface gap between adjacent fills
+                    "fillOpacity": 90,
+                    "spanNulls": False,
+                    "insertNulls": False,
+                    "hideFrom": {"legend": False, "tooltip": False, "viz": False},
+                },
+            },
+            "overrides": overrides or [],
+        },
+        "options": {
+            "mergeValues": True,
+            "showValue": "never",
+            "alignValue": "center",
+            "rowHeight": 0.9,
+            "perPage": 20,
+            "legend": {"showLegend": True, "displayMode": "list", "placement": "bottom"},
+            "tooltip": {"mode": "single", "sort": "none"},
+        },
+    }
+
+
 def row(title, y, collapsed=False, panels=None):
     return {
         "type": "row",
@@ -288,9 +377,7 @@ def capacity_dashboard():
              "boot storm that hurts.",
     ))
     p.append(gauge(
-        "Compute memory used",
-        '100 * cml_compute_memory_bytes{state="used"} / cml_compute_memory_bytes{state="total"}',
-        16, 10, 8, 4,
+        "Compute memory used", MEM_USED_PCT, 16, 10, 8, 4,
         desc="20.5 GB total. Memory has never been the constraint here -- cores are.",
     ))
 
@@ -438,10 +525,325 @@ def fabric_dashboard():
     )
 
 
+# --------------------------------------------------------------- overview ----
+
+# Columns Grafana invents while joining instant frames. Each query contributes a
+# Time field; only the join key and the value columns are wanted.
+_JOIN_JUNK = {f"Time {i}": True for i in range(1, 8)} | {"Time": True}
+
+
+def _col(name, **props):
+    """A per-column override, addressed by the name the organize step gave it."""
+    return {"matcher": {"id": "byName", "options": name},
+            "properties": [{"id": k.replace("__", "."), "value": v}
+                           for k, v in props.items()]}
+
+
+def _pct_cell(warn=75, crit=90):
+    """A percent column drawn as an in-cell meter rather than a bare number."""
+    return {
+        "unit": "percent",
+        "min": 0,
+        "max": 100,
+        "decimals": 1,
+        "custom__cellOptions": {"type": "gauge", "mode": "gradient"},
+        "thresholds": _thresholds([(GOOD, None), (WARNING, warn), (CRITICAL, crit)]),
+    }
+
+
+NODE_STATE_MAP = [{"type": "value", "options": {
+    "BOOTED":          {"text": "BOOTED",   "color": GOOD,     "index": 0},
+    "STARTED":         {"text": "STARTED",  "color": GOOD,     "index": 1},
+    "BOOTING":         {"text": "BOOTING",  "color": WARNING,  "index": 2},
+    "QUEUED":          {"text": "QUEUED",   "color": WARNING,  "index": 3},
+    "STOPPED":         {"text": "STOPPED",  "color": MUTED,    "index": 4},
+    "DEFINED_ON_CORE": {"text": "DEFINED",  "color": MUTED,    "index": 5},
+}}]
+
+UP_DOWN_MAP = [{"type": "value", "options": {
+    "0": {"text": "DOWN", "color": CRITICAL, "index": 0},
+    "1": {"text": "UP",   "color": GOOD,     "index": 1},
+}}]
+
+
+def overview_dashboard():
+    """Everything about the fabric on one page: inventory, state history,
+    throughput, errors, capacity, and the Pi carrying it all."""
+    lab = '{lab="$lab"}'
+    p = []
+
+    # ---- at a glance -------------------------------------------------------
+    p.append(row("At a glance", 0))
+    # topk(1, ...) not a bare match: over a 6h window a lab that was stopped and
+    # restarted has both a STOPPED and a STARTED series with a last-non-null of
+    # 1, and the tile renders two state names side by side.
+    p.append(stat("Lab state", f"topk(1, cml_lab_state_info{lab} == 1)", 0, 1, 3, 4,
+                  unit="none", text_size=28,
+                  desc="The lab's own state as CML reports it."))
+    p[-1]["targets"][0]["legendFormat"] = "{{state}}"
+    p[-1]["options"]["textMode"] = "name"
+    p[-1]["fieldConfig"]["defaults"]["thresholds"] = _thresholds([(GOOD, None)])
+
+    p.append(stat("Nodes booted", f"sum(cml_node_booted{lab})", 3, 1, 3, 4,
+                  unit="none", text_size=40,
+                  steps=[(CRITICAL, None), (GOOD, 8)],
+                  desc="Nodes that reached BOOTED, out of 8 in phase 1."))
+    p.append(stat("Links up", f"sum(cml_link_up{lab})", 6, 1, 3, 4, unit="none",
+                  text_size=40, steps=[(CRITICAL, None), (GOOD, 8)]))
+    p.append(stat("Links down",
+                  f"count(cml_link_up{lab}) - sum(cml_link_up{lab})",
+                  9, 1, 3, 4, unit="none", text_size=40,
+                  steps=[(GOOD, None), (CRITICAL, 1)],
+                  desc="Anything above zero is a broken adjacency."))
+    p.append(stat("CPU oversubscription",
+                  "cml_compute_cpu_predicted / cml_compute_cpu_count",
+                  12, 1, 3, 4, unit="none", decimals=1, text_size=40, graph="area",
+                  steps=[(GOOD, None), (WARNING, 1.0), (SERIOUS, 2.0), (CRITICAL, 3.0)],
+                  desc="Cores CML thinks the running nodes need, over the six the "
+                       "box actually has."))
+    p.append(stat("Fabric throughput",
+                  f"sum(rate(cml_link_read_bytes_total{lab}[5m])) * 8",
+                  15, 1, 3, 4, unit="bps", text_size=32))
+    p.append(stat("Drops (1h)", f"sum(increase(cml_link_drops_total{lab}[1h]))",
+                  18, 1, 3, 4, unit="none", text_size=40,
+                  steps=[(GOOD, None), (WARNING, 1), (CRITICAL, 100)],
+                  desc="Frames the virtual wire lost in the last hour."))
+    p.append(stat("CML API", "cml_up", 21, 1, 3, 4, unit="none", text_size=28,
+                  steps=[(CRITICAL, None), (GOOD, 1)],
+                  desc="Whether the exporter could reach the CML API on its last scrape."))
+    p[-1]["fieldConfig"]["defaults"]["mappings"] = UP_DOWN_MAP
+
+    # ---- nodes -------------------------------------------------------------
+    p.append(row("Nodes", 5))
+    p.append(table(
+        "Node inventory",
+        [
+            _target(f"sum by (node, kind, state) (cml_node_state_info{lab})", ref="A", instant=True),
+            _target(f"sum by (node) (cml_node_cpu_percent{lab})", ref="B", instant=True),
+            _target(f"sum by (node) (cml_node_ram_percent{lab})", ref="C", instant=True),
+            _target(f"sum by (node) (cml_node_ram_allocated_bytes{lab})", ref="D", instant=True),
+            _target(f"sum by (node) (cml_node_uptime_seconds{lab})", ref="E", instant=True),
+        ],
+        0, 6, 24, 10,
+        desc="Every node in the lab, with what it is, what state it is in, and what "
+             "it is consuming right now.",
+        sort_by="Node",
+        transformations=[
+            {"id": "joinByField", "options": {"byField": "node", "mode": "outer"}},
+            {"id": "organize", "options": {
+                "excludeByName": _JOIN_JUNK | {"Value #A": True},
+                "renameByName": {
+                    "node": "Node", "kind": "Kind", "state": "State",
+                    "Value #B": "CPU %", "Value #C": "RAM %",
+                    "Value #D": "RAM allocated", "Value #E": "Uptime",
+                },
+                "indexByName": {"node": 0, "kind": 1, "state": 2, "Value #B": 3,
+                                "Value #C": 4, "Value #D": 5, "Value #E": 6},
+            }},
+        ],
+        overrides=[
+            _col("State", mappings=NODE_STATE_MAP,
+                 custom__cellOptions={"type": "color-text"}),
+            _col("CPU %", **_pct_cell(warn=60, crit=85)),
+            _col("RAM %", **_pct_cell()),
+            _col("RAM allocated", unit="bytes"),
+            _col("Uptime", unit="s"),
+        ],
+    ))
+
+    p.append(state_timeline(
+        "Node state history",
+        [_target(f"cml_node_booted{lab}", "{{node}}")],
+        0, 16, 24, 8, UP_DOWN_MAP,
+        desc="A red band is a node that was not BOOTED. Read it left to right to see "
+             "exactly when a reload happened.",
+    ))
+
+    p.append(timeseries(
+        "Per-node CPU", [_target(f"cml_node_cpu_percent{lab}", "{{node}}")],
+        0, 24, 12, 9, unit="percent", legend_calcs=["lastNotNull", "max"],
+        desc="IOL nodes idle near 1%. A sustained climb is a control-plane loop.",
+        overrides=_color_overrides(NODE_COLORS),
+    ))
+    p.append(timeseries(
+        "Per-node RAM", [_target(f"cml_node_ram_percent{lab}", "{{node}}")],
+        12, 24, 12, 9, unit="percent", legend_calcs=["lastNotNull", "max"],
+        desc="Percent of each node's own allocation, not of the host.",
+        overrides=_color_overrides(NODE_COLORS),
+    ))
+
+    # ---- links -------------------------------------------------------------
+    p.append(row("Links", 33))
+    p.append(table(
+        "Link inventory",
+        [
+            _target(f"sum by (link, node_a, node_b) (cml_link_up{lab})", ref="A", instant=True),
+            _target(f"sum by (link) (rate(cml_link_read_bytes_total{lab}[5m])) * 8", ref="B", instant=True),
+            _target(f"sum by (link) (rate(cml_link_write_bytes_total{lab}[5m])) * 8", ref="C", instant=True),
+            _target(f"sum by (link) (rate(cml_link_drops_total{lab}[5m]))", ref="D", instant=True),
+            _target(f"sum by (link) (increase(cml_link_drops_total{lab}[1h]))", ref="E", instant=True),
+        ],
+        0, 34, 24, 10,
+        desc="Every virtual wire, its endpoints, both directions of traffic, and its "
+             "error rate.",
+        sort_by="Link",
+        transformations=[
+            {"id": "joinByField", "options": {"byField": "link", "mode": "outer"}},
+            {"id": "organize", "options": {
+                "excludeByName": _JOIN_JUNK,
+                "renameByName": {
+                    "link": "Link", "node_a": "A side", "node_b": "B side",
+                    "Value #A": "Status", "Value #B": "Rx", "Value #C": "Tx",
+                    "Value #D": "Drops/s", "Value #E": "Drops (1h)",
+                },
+                "indexByName": {"link": 0, "node_a": 1, "node_b": 2, "Value #A": 3,
+                                "Value #B": 4, "Value #C": 5, "Value #D": 6,
+                                "Value #E": 7},
+            }},
+        ],
+        overrides=[
+            _col("Status", mappings=UP_DOWN_MAP,
+                 custom__cellOptions={"type": "color-text"}),
+            _col("Rx", unit="bps", decimals=0),
+            _col("Tx", unit="bps", decimals=0),
+            _col("Drops/s", unit="pps", decimals=2,
+                 thresholds=_thresholds([(GOOD, None), (WARNING, 0.01), (CRITICAL, 1)]),
+                 custom__cellOptions={"type": "color-text"}),
+            _col("Drops (1h)", unit="none", decimals=0,
+                 thresholds=_thresholds([(GOOD, None), (WARNING, 1), (CRITICAL, 100)]),
+                 custom__cellOptions={"type": "color-text"}),
+        ],
+    ))
+
+    p.append(state_timeline(
+        "Link state history",
+        [_target(f"cml_link_up{lab}", "{{link}}")],
+        0, 44, 24, 9, UP_DOWN_MAP,
+        desc="Flapping shows up here as stripes. A steady green bar per link is what "
+             "a healthy fabric looks like.",
+    ))
+
+    p.append(timeseries(
+        "Per-link throughput",
+        [_target(f"(rate(cml_link_read_bytes_total{lab}[5m]) "
+                 f"+ rate(cml_link_write_bytes_total{lab}[5m])) * 8", "{{link}}")],
+        0, 53, 12, 9, unit="bps", legend_calcs=["lastNotNull", "max"],
+        desc="Both directions summed, from CML's own link counters.",
+        overrides=_color_overrides(LINK_COLORS),
+    ))
+    p.append(timeseries(
+        "Packet drops per link",
+        [_target(f"rate(cml_link_drops_total{lab}[5m])", "{{link}}")],
+        12, 53, 12, 9, unit="pps", legend_calcs=["lastNotNull", "max"],
+        desc="The error-rate view. Flat on zero is correct; anything else is a "
+             "starved vSwitch.",
+        overrides=_color_overrides(LINK_COLORS),
+    ))
+
+    # ---- capacity ----------------------------------------------------------
+    p.append(row("Capacity on the compute", 62))
+    p.append(gauge("Compute CPU", "cml_compute_cpu_percent", 0, 63, 6, 6,
+                   desc="Actual utilisation. It is the boot storm that hurts, not "
+                        "steady state."))
+    p.append(gauge("Compute memory used", MEM_USED_PCT, 6, 63, 6, 6,
+                   desc="20.5 GB total. Memory has never been the constraint "
+                        "here -- cores are."))
+    p.append(gauge("Compute disk used", DISK_USED_PCT, 12, 63, 6, 6,
+                   steps=[(GOOD, None), (WARNING, 80), (CRITICAL, 92)]))
+    p.append(stat("Nodes running on compute", 'cml_compute_nodes{state="running"}',
+                  18, 63, 6, 6, unit="none",
+                  desc="Across every lab on this compute, not just the selected one."))
+
+    p.append(timeseries(
+        "CPU demand vs physical capacity",
+        [
+            _target("cml_compute_cpu_predicted", "Predicted need", "A"),
+            _target("cml_compute_allocated_cpus", "Allocated", "B"),
+            _target("cml_compute_cpu_count", "Physical cores", "C"),
+        ],
+        0, 69, 12, 9, unit="none", legend_calcs=["lastNotNull", "max"],
+        desc="Physical cores is a limit, not a series -- grey and dashed, so the two "
+             "real measures read against it.",
+        overrides=_color_overrides(
+            {"Predicted need": SERIES[0], "Allocated": SERIES[1],
+             "Physical cores": MUTED},
+            extra={"Physical cores": [
+                {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}},
+            ]},
+        ),
+    ))
+    p.append(timeseries(
+        "Load average", [_target("cml_compute_load", "{{window}}")],
+        12, 69, 12, 9, unit="none", legend_calcs=["lastNotNull", "max"],
+        desc="Compare against 6 cores: sustained load above 6 is real contention.",
+        overrides=_color_overrides(
+            {"1m": SERIES[0], "5m": SERIES[1], "15m": SERIES[2]}),
+    ))
+
+    # ---- the Pi ------------------------------------------------------------
+    p.append(row("Raspberry Pi (the box doing the monitoring)", 78, collapsed=True,
+                 panels=[
+        gauge("Pi CPU",
+              '100 - (avg(rate(node_cpu_seconds_total{job="pi",mode="idle"}[5m])) * 100)',
+              0, 79, 6, 6),
+        gauge("Pi temperature", 'max(node_thermal_zone_temp{job="pi"})',
+              6, 79, 6, 6, unit="celsius", max_=90,
+              steps=[(GOOD, None), (WARNING, 65), (CRITICAL, 80)],
+              desc="Throttling starts around 80 C. This is the closest thing to a "
+                   "power reading the lab has -- the nodes are virtual, so there is "
+                   "no PSU or PDU to measure."),
+        gauge("Pi memory used",
+              '100 * (1 - node_memory_MemAvailable_bytes{job="pi"} '
+              '/ node_memory_MemTotal_bytes{job="pi"})',
+              12, 79, 6, 6),
+        gauge("Pi disk used (/)",
+              '100 - 100 * node_filesystem_avail_bytes{job="pi",mountpoint="/"} '
+              '/ node_filesystem_size_bytes{job="pi",mountpoint="/"}',
+              18, 79, 6, 6),
+        timeseries("Pi temperature over time",
+                   [_target('node_thermal_zone_temp{job="pi"}', "{{type}}")],
+                   0, 85, 12, 8, unit="celsius", min_=None,
+                   legend_calcs=["lastNotNull", "max"],
+                   overrides=_color_overrides({"cpu-thermal": SERIES[0]})),
+        timeseries("Pi network errors",
+                   [
+                       _target('rate(node_network_receive_errs_total{job="pi"}[5m])',
+                               "{{device}} rx", "A"),
+                       _target('rate(node_network_transmit_errs_total{job="pi"}[5m])',
+                               "{{device}} tx", "B"),
+                   ],
+                   12, 85, 12, 8, unit="pps", legend_calcs=["lastNotNull", "max"],
+                   desc="Errors on the Pi's own NIC. Flat zero means the metrics "
+                        "pipeline itself is not the problem."),
+    ]))
+
+    lab_var = {
+        "type": "query",
+        "name": "lab",
+        "label": "Lab",
+        "datasource": DS,
+        "query": "label_values(cml_lab_state_info, lab)",
+        "refresh": 1,
+        "includeAll": False,
+        "multi": False,
+        "current": {},
+        "options": [],
+    }
+    return dashboard(
+        "CML Lab - Command Center", "cml-lab-overview", p,
+        description=("Single-pane view of the spine-leaf lab: node inventory and state "
+                     "history, link status and error rates, compute headroom, and the "
+                     "Pi that scrapes it all."),
+        variables=[lab_var],
+        tags=["cml", "lab", "overview"],
+    )
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     for name, build in (("cml-capacity", capacity_dashboard),
-                        ("cml-fabric", fabric_dashboard)):
+                        ("cml-fabric", fabric_dashboard),
+                        ("cml-overview", overview_dashboard)):
         path = OUT / f"{name}.json"
         path.write_text(json.dumps(build(), indent=2) + "\n")
         print(f"wrote {path.relative_to(Path.cwd())}")

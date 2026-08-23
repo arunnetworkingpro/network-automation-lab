@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import socket
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx  # virl2_client's session is an httpx client, not requests
 
 from prometheus_client import REGISTRY, start_http_server
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
@@ -33,6 +37,43 @@ log = logging.getLogger("cml_exporter")
 # always fresh; only this naming layer is cached.
 TOPOLOGY_TTL = 300
 
+# A CML host that has been powered off does not refuse connections -- it answers
+# nothing at all, so a socket with no timeout waits out the kernel's SYN retries
+# (~130s here). Alloy gives up on the scrape at 30s, so an untimed exporter turns
+# "CML is down" into "no metrics at all", and the one alert that names the actual
+# problem never gets a value to fire on. Every path to the CML host is bounded:
+PROBE_TIMEOUT = 3.0  # TCP reachability, before the client library logs in
+CONNECT_TIMEOUT = 5.0
+READ_TIMEOUT = 15.0  # a cold CML API genuinely takes seconds to answer
+# One collect() makes ~15 sequential calls, so per-request timeouts alone do not
+# bound a scrape: fifteen slow-but-successful calls sail past Alloy's 30s
+# scrape_timeout and the scrape is discarded whole. The budget is the real
+# guarantee; per-request timeouts just stop any single call hogging it.
+COLLECT_BUDGET = 20.0
+
+
+def _assert_reachable() -> None:
+    """Fail fast if the CML host is not accepting connections."""
+    from cml.client import load_env
+
+    host = load_env()["CML_HOST"]
+    # startswith("http") alone would treat a hostname like "http-cml.lab" as a
+    # URL; urlparse then yields hostname=None and the probe quietly tests
+    # localhost instead of CML.
+    parsed = urlparse(host if host.startswith(("http://", "https://"))
+                      else f"https://{host}")
+    if not parsed.hostname:
+        raise httpx.ConnectError(f"CML_HOST is not usable as a host: {host!r}")
+    target = (parsed.hostname, parsed.port or 443)
+    try:
+        with socket.create_connection(target, timeout=PROBE_TIMEOUT):
+            pass
+    except OSError as exc:
+        # httpx.ConnectError, not the builtin, so _get's no-retry branch catches
+        # it -- otherwise the "maybe the token expired" retry probes twice.
+        raise httpx.ConnectError(
+            f"CML at {target[0]}:{target[1]} unreachable: {exc}")
+
 
 class CMLCollector:
     """Scrapes CML on demand. One instance, reused across scrapes."""
@@ -41,12 +82,26 @@ class CMLCollector:
         self._client = None
         self._topology: dict[str, dict] = {}
         self._topology_at = 0.0
+        self._deadline = 0.0
+
+    def _budget(self) -> httpx.Timeout:
+        """Per-request timeouts, clipped to what is left of the scrape budget."""
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise httpx.ConnectTimeout(
+                f"scrape budget of {COLLECT_BUDGET}s exhausted")
+        return httpx.Timeout(min(READ_TIMEOUT, left),
+                             connect=min(CONNECT_TIMEOUT, left))
 
     # -- connection -------------------------------------------------------
 
     @property
     def session(self):
         if self._client is None:
+            # ClientLibrary authenticates in its constructor and takes no
+            # timeout, so the only way to bound that call is to refuse to make
+            # it when nothing is listening.
+            _assert_reachable()
             log.info("authenticating to CML")
             self._client = connect()
         return self._client._session
@@ -54,11 +109,21 @@ class CMLCollector:
     def _get(self, endpoint: str):
         """GET an endpoint, re-authenticating once if the token has expired."""
         try:
-            return self.session.get(endpoint).json()
+            return self.session.get(endpoint, timeout=self._budget()).json()
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # Deliberately NOT every TransportError: a read timeout means CML is
+            # slow, not gone. Treating slow as gone drops the client, empties the
+            # scrape, and pages "CML API unreachable" for a box that is merely
+            # busy -- which is the normal state during a boot storm. Retrying
+            # every endpoint against a genuinely dead box is also how a
+            # 3-second failure becomes a 30-second one, so this branch drops the
+            # client and lets collect() emit cml_up 0 promptly.
+            self._client = None
+            raise
         except Exception as exc:
             log.warning("%s failed (%s); reconnecting", endpoint, exc)
             self._client = None
-            return self.session.get(endpoint).json()
+            return self.session.get(endpoint, timeout=self._budget()).json()
 
     # -- naming layer -----------------------------------------------------
 
@@ -91,6 +156,7 @@ class CMLCollector:
 
     def collect(self):
         started = time.monotonic()
+        self._deadline = started + COLLECT_BUDGET
         up = GaugeMetricFamily("cml_up", "1 if the CML API answered this scrape")
         try:
             yield from self._collect_system()
