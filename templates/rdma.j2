@@ -19,6 +19,10 @@ users:
     shell: /bin/bash
     lock_passwd: false
     plain_text_passwd: {{ password }}
+{% if ssh_key %}
+    ssh_authorized_keys:
+      - {{ ssh_key }}
+{% endif %}
 
 ssh_pwauth: true
 

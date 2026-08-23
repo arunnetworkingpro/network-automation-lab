@@ -66,6 +66,7 @@ def render_cloud_init(topo: dict, spec: dict, fab_if: str) -> str:
         name=spec["name"],
         user=load_env().get("LAB_USER", "arun"),
         password=load_env()["LAB_DEVICE_PASS"],
+        ssh_key=load_env().get("LAB_ADMIN_SSH_PUBKEY") or None,
         fab_if=fab_if,
         fab_ip=spec["fabric_ip"],
         fab_vlan=spec["vlan"],

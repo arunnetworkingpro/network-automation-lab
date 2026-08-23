@@ -63,6 +63,16 @@ def device_password() -> str:
     return pw
 
 
+def device_ssh_key() -> str | None:
+    """Admin's SSH public key for cloud-init hosts, from ~/.cml.env.
+
+    Optional -- LAB_ADMIN_SSH_PUBKEY is a public key, not a secret, but it lives
+    next to the other lab config anyway rather than being hardcoded here. Hosts
+    without cloud-init (the IOS devices, Alpine) do not consume this at all.
+    """
+    return load_env().get("LAB_ADMIN_SSH_PUBKEY") or None
+
+
 def netmask(cidr: str) -> str:
     return str(IPNetwork(cidr).netmask)
 
@@ -120,6 +130,7 @@ def main() -> None:
     leaf_lo = [l["loopback"] for l in topo["leaves"]]
     user = "arun"
     password = device_password()
+    ssh_key = device_ssh_key()
 
     CONFIGS.mkdir(exist_ok=True)
     rendered: dict[str, str] = {}
@@ -142,6 +153,7 @@ def main() -> None:
             links=sorted(uplinks, key=lambda x: x["intf"]),
             clients=leaf_lo,
             overlay=overlay,
+            ssh_key=ssh_key,
         )
 
     # --- leaves ------------------------------------------------------------
@@ -258,6 +270,7 @@ def main() -> None:
             static_routes=static_routes,
             overlay=overlay,
             evpn_vlans=evpn_vlans,
+            ssh_key=ssh_key,
         )
 
     # --- servers -----------------------------------------------------------
@@ -290,7 +303,7 @@ def main() -> None:
             name=jump["name"],
             user=user,
             password=password,
-            ssh_key=None,
+            ssh_key=ssh_key,
             fab_if=fab["interface"],
             fab_ip=jump["fabric_ip"],
             fab_vlan=jump["vlan"],

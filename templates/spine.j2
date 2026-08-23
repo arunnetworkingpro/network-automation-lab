@@ -14,6 +14,18 @@ ip routing
 username {{ user }} privilege 15 secret {{ password }}
 enable secret {{ password }}
 !
+{% if ssh_key %}
+! Public-key auth alongside the password, not instead of it -- if the key ever
+! fails to match (CiscoSSH quirk, key rotated), password login still gets you in.
+ip ssh server algorithm publickey ssh-ed25519
+ip ssh pubkey-chain
+ username {{ user }}
+  key-string
+   {{ ssh_key.split(' ')[1] }}
+  exit
+ exit
+!
+{% endif %}
 interface Loopback0
  description router-id and BGP peering source
  ip address {{ loopback }} 255.255.255.255
