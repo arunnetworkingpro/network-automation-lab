@@ -347,13 +347,22 @@ minute, and 134 CML series plus 281 from the Pi leaves most of the 10,000 spare.
   peering forms in both directions, and a ping actually crosses the tunnel. Until that
   passes, the overlay is configured but not proven end to end.
 - Phase 2b: distributed anycast gateway
-- **RDMA / Soft-RoCE — scaffolded, not solved.** `rdma1` (ubuntu, `leaf2`/VLAN 20) sits
+- **RDMA / Soft-RoCE — working, cross-fabric.** `rdma1` (ubuntu, `leaf2`/VLAN 20) sits
   deliberately opposite `jump` in the topology, so `ib_send_bw` between the two RoCE
   hosts crosses `leaf1 → spine → leaf2` and measures the fabric rather than loopback.
-  `ibfabric/` carries the Soft-RoCE (`rdma_rxe`) setup and a fat-tree netlist for a
-  later, bigger topology. Cross-fabric `ib_send_bw` still hangs between the two hosts
-  — parked, not yet root-caused; `sys-2470/` is a captured `/sys/class/infiniband*`
-  dump from that debugging session, kept for whenever this gets picked back up.
+  Root cause of the long-parked hang: `rdma_rxe` ships in `linux-modules-extra`, keyed
+  to one exact kernel build, and `jump`'s running kernel had drifted to an orphaned
+  point release with no matching package left in the archive — `modprobe` just failed
+  silently, no amount of retrying `ib_send_bw` was ever going to fix that.
+  `ibfabric/setup_roce.py` now detects that case and moves to a current kernel
+  (`apt install linux-generic` + reboot) automatically. The "hang" itself was a second,
+  unrelated red herring: `ib_send_bw` buffers output until the run completes, so an
+  external `timeout` shorter than its default iteration count discarded the results,
+  not the connection — it's called with `-D` for a bounded run now. `rdma1` has no
+  internet of its own; run `scripts/fabric_nat.py` once first so its `apt` calls have
+  a route out. `sys-2470/` is the `/sys/class/infiniband*` dump from the original
+  debugging session, kept for reference. `ibfabric/` also carries a fat-tree netlist
+  for a later, bigger topology, not yet built.
 - **Fabric access from off the home LAN — no router static route available.** The
   ISP modem supports DMZ only, not a static route, and there is no separate router
   to add one on. So `10.0.0.0/8 via 192.168.2.50` from the design section above is
