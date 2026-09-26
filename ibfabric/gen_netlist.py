@@ -33,7 +33,8 @@ SWITCH_PORTS = 36
 HCA_PORTS = 2
 
 
-def build(spines: int, leaves: int, per_leaf: int, real_hosts: list[str]) -> str:
+def build(spines: int, leaves: int, per_leaf: int, real_hosts: list[str],
+          sm_hosts: list[str] = ()) -> str:
     uplinks = spines  # every leaf lands one port on every spine
     if per_leaf + uplinks > SWITCH_PORTS:
         raise SystemExit(
@@ -51,6 +52,14 @@ def build(spines: int, leaves: int, per_leaf: int, real_hosts: list[str]) -> str
             f"HCAs: {', '.join(real_hosts[total:])} would not exist")
     names = list(real_hosts)
     names += [f"h{i:03d}" for i in range(len(names) + 1, total + 1)]
+
+    # Subnet-manager hosts (the UFM pair) take the last slot of leaves spread
+    # across the fabric -- first and last leaf for two -- so losing one leaf
+    # cannot take out both SMs. Same reason real UFM HA pairs sit on different
+    # leaves.
+    for k, sm in enumerate(sm_hosts):
+        leaf_idx = 0 if len(sm_hosts) == 1 else round(k * (leaves - 1) / (len(sm_hosts) - 1))
+        names[leaf_idx * per_leaf + per_leaf - 1] = sm
 
     def host_of(leaf_idx: int, slot: int) -> str:
         return names[leaf_idx * per_leaf + slot]
@@ -94,11 +103,15 @@ def main() -> None:
     ap.add_argument("--real-hosts", default="jump,srv-app1,srv-db1",
                     help="comma-separated names placed first, so live Linux "
                          "hosts can attach as those HCAs via SIM_HOST")
+    ap.add_argument("--sm-hosts", default="ufm1,ufm2",
+                    help="comma-separated subnet-manager hosts, spread across "
+                         "leaves; start_fabric.sh runs one OpenSM on each")
     ap.add_argument("--out", default="fat-tree.net")
     args = ap.parse_args()
 
     real = [h.strip() for h in args.real_hosts.split(",") if h.strip()]
-    text = build(args.spines, args.leaves, args.hosts_per_leaf, real)
+    sms = [h.strip() for h in args.sm_hosts.split(",") if h.strip()]
+    text = build(args.spines, args.leaves, args.hosts_per_leaf, real, sms)
 
     OUT.mkdir(parents=True, exist_ok=True)
     path = OUT / args.out
@@ -108,6 +121,7 @@ def main() -> None:
     print(f"  {args.spines} spines + {args.leaves} leaves + {hosts} HCAs "
           f"= {args.spines + args.leaves + hosts} nodes")
     print(f"  attachable as real hosts: {', '.join(real)}")
+    print(f"  subnet-manager hosts: {', '.join(sms)}")
 
 
 if __name__ == "__main__":

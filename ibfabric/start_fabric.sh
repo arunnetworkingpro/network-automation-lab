@@ -39,19 +39,35 @@ done
 grep -q "Network simulator ready" "$RUN/log/ibsim.log" || {
     echo "ibsim did not come up; see $RUN/log/ibsim.log" >&2; exit 1; }
 
-echo "starting opensm"
 export LD_PRELOAD="$SHIM" IBSIM_SERVER_NAME=127.0.0.1
-opensm --daemon --log_file "$RUN/log/opensm.log" > "$RUN/log/osm.out" 2>&1
+
+# Two subnet managers, the way a UFM HA pair runs them: one per SM host
+# (gen_netlist.py puts ufm1 and ufm2 on different leaves). Higher priority wins
+# the election; the other sits in STANDBY polling the master and takes over
+# when it stops answering. Each needs its own cache dir and log, or they
+# trample each other's guid2lid files. SIM_HOST picks which simulated HCA the
+# process attaches as.
+start_sm() {  # name priority
+    local name=$1 prio=$2
+    mkdir -p "$RUN/cache-$name" "$RUN/dump-$name"
+    echo "starting opensm on $name (priority $prio)"
+    SIM_HOST="$name" OSM_CACHE_DIR="$RUN/cache-$name" \
+        opensm --daemon -p "$prio" --log_file "$RUN/log/opensm-$name.log" \
+        --dump_files_dir "$RUN/dump-$name" \
+        > "$RUN/log/osm-$name.out" 2>&1
+}
+start_sm ufm1 14
+start_sm ufm2 10
 
 for _ in $(seq 60); do
-    grep -q "SUBNET UP" "$RUN/log/opensm.log" 2>/dev/null && break
+    grep -q "SUBNET UP" "$RUN/log/opensm-ufm1.log" 2>/dev/null && break
     sleep 2
 done
 
-if grep -q "SUBNET UP" "$RUN/log/opensm.log" 2>/dev/null; then
-    echo "fabric up -- logs in $RUN/log"
+if grep -q "SUBNET UP" "$RUN/log/opensm-ufm1.log" 2>/dev/null; then
+    echo "fabric up -- logs in $RUN/log; check roles with ibfabric/sm_status.sh"
 else
-    echo "opensm did not report SUBNET UP; last lines:" >&2
-    tail -n 5 "$RUN/log/opensm.log" "$RUN/log/osm.out" >&2
+    echo "opensm on ufm1 did not report SUBNET UP; last lines:" >&2
+    tail -n 5 "$RUN/log/opensm-ufm1.log" "$RUN/log/osm-ufm1.out" >&2
     exit 1
 fi
