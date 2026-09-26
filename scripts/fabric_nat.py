@@ -63,7 +63,7 @@ def main() -> None:
 
     with Host(JUMP_LAN) as jump:
         if "sshpass" not in jump.run("command -v sshpass || true", check=False):
-            jump.sudo("DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass",
+            jump.sudo("DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass",
                       timeout=600)
 
         rule = (f"-t nat {{action}} POSTROUTING -s {FABRIC_CIDR} "
