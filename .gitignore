@@ -24,3 +24,6 @@ fact_cache/
 # Local scratch
 scratch/
 *.log
+
+# libumad2sim fake sysfs, one per IB process (sys-2470/ is a tracked reference dump)
+sys-*/
