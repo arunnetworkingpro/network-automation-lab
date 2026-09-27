@@ -20,7 +20,7 @@ rm -rf "$work"/sys-* 2>/dev/null
 
 if [ $# -gt 0 ]; then
     source "$HERE/ibenv.sh" >/dev/null 2>&1
-    export SIM_HOST=$host
+    export SIM_HOST=$host PATH="$PATH:/usr/sbin:/sbin"
     "$@" 2> >(grep -v '^ibwarn' >&2)
     rc=$?
     rm -rf "$work"/sys-* 2>/dev/null
@@ -31,7 +31,12 @@ cat >"$rc" <<RC
 [ -f ~/.bashrc ] && source ~/.bashrc
 source "$HERE/ibenv.sh" >/dev/null 2>&1
 export SIM_HOST=$host
-PS1="[$host \\W]\\$ "
-echo "on $host (simulated) -- try: ibstat, sminfo, ibhosts, iblinkinfo | less; exit to leave"
+# infiniband-diags installs into /usr/sbin, which a non-login ssh shell lacks
+export PATH="\$PATH:/usr/sbin:/sbin:$HERE/bin"
+# Lab-only: no passwordless sudo on the Pi, and these tools need no root here.
+# 'sudo <cmd>' runs <cmd> directly, so real-world commands paste in unchanged.
+sudo() { "\$@"; }
+PS1="\\u@${host/ufm/ufm0}:~\\$ "
+echo "$(echo ${host/ufm/ufm0}) -- simulated IB subnet manager (ibsim). exit to leave."
 RC
 exec bash --rcfile "$rc" -i

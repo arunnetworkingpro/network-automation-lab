@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# LAB STAND-IN for NVIDIA UFM's `ufm_ha_cluster` -- same name and verbs, so the
+# muscle memory transfers, but it is NOT UFM. Real UFM HA is Pacemaker + DRBD
+# around UFM Enterprise; here the "cluster" is the two OpenSM instances in ibsim
+# (ibfabric/start_fabric.sh), and promoted == the SM that sminfo reports MASTER.
+#
+#   ufm_ha_cluster status      which node is Promoted / Unpromoted
+#   ufm_ha_cluster failover    stop the promoted SM; the standby takes over
+#                              (~56 s: OpenSM polls every 10 s, 4 retries)
+#   ufm_ha_cluster start       start any SM that is not running
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$HERE/ibenv.sh" >/dev/null 2>&1
+export PATH="$PATH:/usr/sbin:/sbin"
+work="$HOME/.local/share/ibfabric/work"; mkdir -p "$work"; cd "$work" || exit 1
+
+role() {   # prints MASTER / STANDBY / ... or DOWN for ufm1|ufm2
+    local h=$1 pid lid
+    pid=$(pgrep -o -f "opensm.*opensm-$h.log")
+    [ -n "$pid" ] || { echo DOWN; return; }
+    lid=$(SIM_HOST=$h ibstat 2>/dev/null | awk '/Base lid/{print $3; exit}')
+    SIM_HOST=$h sminfo "$lid" 2>/dev/null | grep -o 'SMINFO_[A-Z]*' | sed 's/SMINFO_//' || echo UNKNOWN
+}
+
+case "${1:-status}" in
+status)
+    declare -A r; for h in ufm1 ufm2; do r[$h]=$(role $h); done
+    name() { echo "${1/ufm/ufm0}"; }
+    promoted=""; unpromoted=""; stopped=""
+    for h in ufm1 ufm2; do
+        case ${r[$h]} in
+            MASTER) promoted+=" $(name $h)" ;;
+            DOWN)   stopped+=" $(name $h)" ;;
+            *)      unpromoted+=" $(name $h)" ;;
+        esac
+    done
+    cat <<OUT
+Cluster Summary:   (lab simulation -- OpenSM pair in ibsim, not UFM Enterprise)
+  * Current DC: ${promoted:- NONE} (partition with quorum)
+  * 2 nodes configured
+
+Node List:
+  * Online: [$(for h in ufm1 ufm2; do [ "${r[$h]}" != DOWN ] && printf ' %s' "$(name $h)"; done) ]
+$( [ -n "$stopped" ] && echo "  * OFFLINE: [$stopped ]")
+
+Full List of Resources:
+  * Clone Set: ha_data_drbd-clone [ha_data_drbd] (promotable):
+    * Promoted: [${promoted:- } ]
+    * Unpromoted: [${unpromoted:- } ]
+$( [ -n "$stopped" ] && echo "    * Stopped: [$stopped ]")
+  * Resource Group: ufm-ha-group:
+    * opensm (subnet manager)  Started ${promoted:-Stopped}
+
+SM detail:
+$(for h in ufm1 ufm2; do printf '  %-6s %s\n' "$(name $h)" "${r[$h]}"; done)
+OUT
+    ;;
+failover)
+    for h in ufm1 ufm2; do
+        if [ "$(role $h)" = MASTER ]; then
+            pkill -f "opensm.*opensm-$h.log" && echo "stopped promoted SM on ${h/ufm/ufm0}; standby takes over in ~60 s -- watch: ufm_ha_cluster status"
+            exit 0
+        fi
+    done
+    echo "no promoted SM found" >&2; exit 1
+    ;;
+start)
+    "$HERE/start_fabric.sh" --sm-only 2>/dev/null || "$HERE/start_fabric.sh"
+    ;;
+*) echo "usage: ufm_ha_cluster status|failover|start" >&2; exit 2 ;;
+esac

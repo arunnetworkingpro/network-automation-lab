@@ -14,6 +14,10 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# --sm-only: leave ibsim and any running SM alone, start only the SMs that are
+# down (what `ufm_ha_cluster start` uses after a failover drill).
+SM_ONLY=0
+[[ "${1:-}" == "--sm-only" ]] && { SM_ONLY=1; shift; }
 NETLIST="${1:-$HERE/netlists/fat-tree.net}"
 RUN="${IBFABRIC_RUN:-$HOME/.local/share/ibfabric}"
 
@@ -26,6 +30,7 @@ mkdir -p "$OSM_CACHE_DIR" "$RUN/log"
 SHIM="$(find /usr/lib -name libumad2sim.so -print -quit 2>/dev/null)"
 [[ -n "$SHIM" ]] || { echo "libumad2sim.so not found -- install ibsim-utils" >&2; exit 1; }
 
+if (( ! SM_ONLY )); then
 pkill -x opensm 2>/dev/null || true
 pkill -x ibsim  2>/dev/null || true
 
@@ -38,6 +43,8 @@ for _ in $(seq 30); do
 done
 grep -q "Network simulator ready" "$RUN/log/ibsim.log" || {
     echo "ibsim did not come up; see $RUN/log/ibsim.log" >&2; exit 1; }
+fi
+pgrep -x ibsim >/dev/null || { echo "ibsim is not running -- run without --sm-only" >&2; exit 1; }
 
 export LD_PRELOAD="$SHIM" IBSIM_SERVER_NAME=127.0.0.1
 
@@ -56,6 +63,13 @@ start_sm() {  # name priority
         --dump_files_dir "$RUN/dump-$name" \
         > "$RUN/log/osm-$name.out" 2>&1
 }
+sm_running() { pgrep -f "opensm.*opensm-$1.log" >/dev/null; }
+if (( SM_ONLY )); then
+    sm_running ufm1 || start_sm ufm1 14
+    sm_running ufm2 || start_sm ufm2 10
+    echo "SMs running -- check roles with: ufm_ha_cluster status"
+    exit 0
+fi
 start_sm ufm1 14
 start_sm ufm2 10
 
