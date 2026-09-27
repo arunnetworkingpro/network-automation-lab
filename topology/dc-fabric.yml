@@ -59,21 +59,38 @@ leaves:
 # carry for no observable difference.
 #
 # 'stretched' is the list of VLANs that exist on EVERY leaf rather than only where
-# a host happens to live -- that is the whole point of the overlay. A stretched
-# VLAN still gets an SVI only where a host lives, because until Phase 2b brings up
-# the distributed anycast gateway, a second copy of 10.10.10.1 is a duplicate
-# address, not a redundant one.
+# a host happens to live -- that is the whole point of the overlay.
+#
+# PHASE 2b: symmetric IRB with a distributed anycast gateway.
+#
+# Every VLAN in tenant.vlans is routed inside VRF TENANT, and a stretched VLAN gets
+# its SVI on EVERY leaf -- same IP, same MAC (anycast_gateway_mac). A host's first
+# hop is always its own leaf, and moving it to another leaf changes nothing for it.
+# Leaf-to-leaf routed traffic rides one shared L3VNI (vlan 900 -> VNI 10900); a
+# non-stretched tenant subnet (VLAN 20) is advertised as an EVPN type-5 route.
+#
+# VLAN 30 (mgmt, the jump box) deliberately stays in the global table, next to the
+# underlay loopbacks Ansible manages the switches through. The two tables are
+# joined by a narrow, explicit leak on every leaf: mgmt + home LAN + default into
+# TENANT, tenant subnets into global -- the shared-services pattern, not a flat
+# network.
 overlay:
   enabled: true
   vni_base: 10000        # VNI = vni_base + vlan id, so 10 -> 10010 and stays readable
   replication: ingress
   stretched: [10]
+  anycast_gateway_mac: 0000.0a0a.0001
+  tenant:
+    vrf: TENANT
+    vlans: [10, 20]
+    l3vni_vlan: 900      # -> VNI 10900, same vni_base rule
+    route_target: "65000:1"
 
 vlans:
   - id: 10
     name: app
     subnet: 10.10.10.0/24
-    gateway: 10.10.10.1      # anycast SVI on every leaf in Phase 2
+    gateway: 10.10.10.1      # anycast: same IP and MAC on every leaf (Phase 2b)
   - id: 20
     name: db
     subnet: 10.10.20.0/24
@@ -96,6 +113,12 @@ servers:
     leaf: leaf2
     vlan: 20
     ip: 10.10.20.11/24
+  # Phase 2b proof host: same VLAN as srv-app1, other leaf. srv-app1 <-> srv-app2
+  # is pure L2 over the VXLAN tunnel (type-2 routes, L2VNI 10010) -- no routing.
+  - name: srv-app2
+    leaf: leaf2
+    vlan: 10
+    ip: 10.10.10.12/24
 
 # PHASE 2b: RDMA hosts, for Soft-RoCE (rdma_rxe) over the Ethernet fabric.
 #

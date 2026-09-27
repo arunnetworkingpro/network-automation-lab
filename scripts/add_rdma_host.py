@@ -205,8 +205,8 @@ def main() -> None:
 
     node.start()
     print("booting", end="", flush=True)
-    deadline = time.time() + BOOT_TIMEOUT
-    while time.time() < deadline:
+    deadline = time.monotonic() + BOOT_TIMEOUT
+    while time.monotonic() < deadline:
         if node.state == "BOOTED":
             break
         print(".", end="", flush=True)

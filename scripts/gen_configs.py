@@ -27,6 +27,7 @@ from netaddr import IPNetwork
 from rich.console import Console
 
 from cml.client import connect, load_env
+from cml.hosts import dhcp_client_id
 
 console = Console()
 
@@ -124,6 +125,16 @@ def main() -> None:
     for v in stretched:
         if v not in vlans:
             sys.exit(f"overlay.stretched lists VLAN {v}, which is not in vlans:")
+    # Phase 2b: symmetric IRB. Absent 'tenant' and the leaves render exactly the
+    # Phase 2a config -- global-table SVIs, L2VNI only.
+    tenant = dict(overlay.get("tenant") or {}) if overlay else {}
+    tenant_vlans = set(tenant.get("vlans", []))
+    for v in tenant_vlans:
+        if v not in vlans:
+            sys.exit(f"overlay.tenant.vlans lists VLAN {v}, which is not in vlans:")
+    if tenant:
+        tenant["l3vni"] = overlay["vni_base"] + tenant["l3vni_vlan"]
+        tenant["gateway_mac"] = overlay["anycast_gateway_mac"]
     spine_names = [s["name"] for s in topo["spines"]]
     leaf_names = [l["name"] for l in topo["leaves"]]
     spine_lo = [s["loopback"] for s in topo["spines"]]
@@ -181,8 +192,9 @@ def main() -> None:
 
         # A stretched VLAN exists on every leaf, whether or not a host sits on this
         # one -- an overlay whose VLANs only appear where a host already is would be
-        # pointless. It gets the VLAN, the EVPN instance and the VNI; it does not get
-        # an SVI, because the anycast gateway is Phase 2b.
+        # pointless. It gets the VLAN, the EVPN instance and the VNI. Its SVI is
+        # anycast in Phase 2b; without a tenant VRF it gets none, as in Phase 2a,
+        # because a second copy of the gateway would be a duplicate address.
         l2_vlans = sorted(local_vlans | set(stretched))
         evpn_vlans = [
             {
@@ -194,22 +206,27 @@ def main() -> None:
             for v in stretched
         ]
 
-        # An SVI only where a host in that VLAN actually lives -- see leaf.j2.
+        svi_vlans = sorted(local_vlans | (set(stretched) if tenant else set()))
         svis = [
             {
                 "id": v,
                 "name": vlans[v]["name"],
                 "gateway": vlans[v]["gateway"],
                 "netmask": netmask(vlans[v]["subnet"]),
+                "vrf": tenant["vrf"] if v in tenant_vlans else None,
+                "anycast": bool(tenant) and v in stretched,
             }
-            for v in sorted(local_vlans)
+            for v in svi_vlans
         ]
+        # Global-table host subnets go in BGP by 'network'; tenant subnets are
+        # redistributed inside the VRF and reach global only through the leak.
         networks = [
             {
                 "network": str(IPNetwork(vlans[v]["subnet"]).network),
                 "netmask": netmask(vlans[v]["subnet"]),
             }
             for v in sorted(local_vlans)
+            if v not in tenant_vlans
         ]
 
         # The leaf hosting the jump owns the way back to the home LAN, and
@@ -228,29 +245,40 @@ def main() -> None:
                 {"network": str(home.network), "netmask": str(home.netmask)}
             )
 
-        # One DHCP pool per host-bearing VLAN, narrowed to a single address.
-        # Excluding everything on either side of the host's IP means the client
-        # can only be offered that one address -- deterministic, with no MAC
-        # reservation to keep in sync.
+        # One manual DHCP binding per server, keyed on its deterministic MAC (see
+        # cml/hosts.py), on EVERY leaf that has an SVI in the server's VLAN. With
+        # an anycast gateway both leaves hear a stretched VLAN's broadcasts and
+        # would race to answer from a plain pool; with identical bindings behind
+        # an identical server address, it no longer matters which one wins.
         dhcp_pools = []
         for srv in topo["servers"]:
-            if srv["leaf"] != name:
+            if srv["vlan"] not in svi_vlans:
                 continue
-            net = IPNetwork(vlans[srv["vlan"]]["subnet"])
-            host = IPNetwork(srv["ip"]).ip
             dhcp_pools.append(
                 {
                     "name": srv["name"],
-                    "network": str(net.network),
-                    "netmask": str(net.netmask),
+                    "host": str(IPNetwork(srv["ip"]).ip),
+                    "netmask": netmask(vlans[srv["vlan"]]["subnet"]),
+                    "client_id": dhcp_client_id(srv["ip"]),
                     "gateway": vlans[srv["vlan"]]["gateway"],
                     "dns": DNS[0],
-                    "exclude_low_start": str(net.network + 1),
-                    "exclude_low_end": str(host - 1),
-                    "exclude_high_start": str(host + 1),
-                    "exclude_high_end": str(net.broadcast - 1),
+                    "vrf": tenant["vrf"] if srv["vlan"] in tenant_vlans else None,
                 }
             )
+
+        # The leak between VRF TENANT and global. Global -> tenant: every
+        # global-table host VLAN, the home LAN, and a default (present only while
+        # fabric_nat.py is on). Tenant -> global: the tenant subnets, never /32s.
+        leak = None
+        if tenant:
+            mgmt = [vlans[v]["subnet"] for v in sorted(vlans) if v not in tenant_vlans]
+            if jump.get("enabled") and jump.get("external"):
+                mgmt.append(str(IPNetwork(jump["external_ip"]).cidr))
+            mgmt.append("0.0.0.0/0")
+            leak = {
+                "to_tenant": mgmt,
+                "to_global": [vlans[v]["subnet"] for v in sorted(tenant_vlans)],
+            }
 
         rendered[name] = env.get_template("leaf.j2").render(
             dhcp_pools=dhcp_pools,
@@ -270,13 +298,17 @@ def main() -> None:
             static_routes=static_routes,
             overlay=overlay,
             evpn_vlans=evpn_vlans,
+            tenant=tenant,
+            leak=leak,
             ssh_key=ssh_key,
         )
 
     # --- servers -----------------------------------------------------------
     for srv in topo["servers"]:
         name = srv["name"]
-        near = next(n for n, f in by_node[name])
+        # Not yet cabled (scripts/add_server.py writes the link map as it cables):
+        # the config is still renderable -- the interface only appears in a comment.
+        near = next((n for n, f in by_node.get(name, [])), {"interface": "eth0"})
         vlan = vlans[srv["vlan"]]
         rendered[name] = env.get_template("server.j2").render(
             name=name,

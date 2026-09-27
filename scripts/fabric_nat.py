@@ -11,7 +11,7 @@ masquerades on behalf of the fabric.
 
 Three pieces, none of which touch the RDMA data path:
   * jump masquerades fabric sources out of its home-LAN NIC
-  * each leaf gets a default route pointing at the jump's fabric address
+  * the jump's leaf gets a default route to the jump, into OSPF and BGP
   * fabric hosts get a resolver, since a static address inherits none
 
 Reversible: `--off` drops the masquerade and the default routes.
@@ -88,10 +88,17 @@ def main() -> None:
         gw_leaf = topo["jump_server"]["leaf"]
         gw_loopback = next(l["loopback"] for l in topo["leaves"]
                            if l["name"] == gw_leaf)
+        # And into global BGP as well: OSPF reaches every global table, but tenant
+        # hosts route in VRF TENANT, which only learns what the leak imports from
+        # global *BGP* (MGMT-NETS includes 0.0.0.0/0 for exactly this).
+        asn = topo["underlay"]["bgp_asn"]
         ios(jump, gw_loopback, [
             f"{verb}ip route 0.0.0.0 0.0.0.0 {jump_fabric}",
             f"router ospf {OSPF_PROCESS}",
             f" {verb}default-information originate",
+            f"router bgp {asn}",
+            " address-family ipv4",
+            f"  {verb}network 0.0.0.0",
         ])
         print(f"{gw_leaf}: default {'removed' if args.off else '-> ' + jump_fabric}"
               f" and {'withdrawn from' if args.off else 'originated into'} OSPF")

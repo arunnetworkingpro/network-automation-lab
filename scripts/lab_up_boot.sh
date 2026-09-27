@@ -17,6 +17,14 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="${LAB_UP_LOG:-$HOME/lab_up.log}"
 
+# No RTC on the Pi: until NTP syncs, date is whatever fake-hwclock last saved.
+# Wait (bounded) for sync so the banner is truthful; lab_up.py itself uses a
+# monotonic clock and does not depend on this.
+for _ in $(seq 1 24); do
+    [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && break
+    sleep 5
+done
+
 {
     echo "=== boot $(date -Is) ==="
     "$ROOT/.venv/bin/python" "$ROOT/scripts/lab_up.py"

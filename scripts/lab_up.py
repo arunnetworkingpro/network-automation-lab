@@ -33,6 +33,13 @@ PYTHON = ROOT / ".venv" / "bin" / "python"
 
 # The Pi and the CML server may power on together, and the controller takes a
 # while to be ready. Failing fast here would defeat the point.
+#
+# Every deadline in this file is on time.monotonic(), never time.time(). The Pi
+# has no RTC: it boots at the last time fake-hwclock saved, and NTP then steps the
+# clock forward by however long it was off -- 3h38m on 26 Sep 2026. A wall-clock
+# deadline set before that step has already "expired" after it, which is why the
+# @reboot runs on 25 and 26 Sep gave up 23 seconds in with "controller never
+# became ready" while the controller was merely still booting.
 CONTROLLER_WAIT = 900
 NODE_WAIT = 600
 # CML reports the jump BOOTED when the VM is up, which is well before sshd is
@@ -55,7 +62,7 @@ def log(msg: str) -> None:
 
 def wait_for_ssh(host: str, deadline: float) -> bool:
     """True once something is listening on 22, False if we run out of time."""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             with socket.create_connection((host, 22), timeout=5):
                 return True
@@ -74,9 +81,9 @@ def main() -> int:
     # --- wait for the controller ------------------------------------------
     from cml.client import connect
 
-    deadline = time.time() + CONTROLLER_WAIT
+    deadline = time.monotonic() + CONTROLLER_WAIT
     client = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             client = connect()
             client.system_info()
@@ -102,13 +109,13 @@ def main() -> int:
         log("lab already started")
 
     # --- wait for the nodes ------------------------------------------------
-    deadline = time.time() + NODE_WAIT
+    deadline = time.monotonic() + NODE_WAIT
     states: dict[str, str] = {}
     while True:
         states = {n.label: n.state for n in lab.nodes()}
         if all(s in READY_STATES for s in states.values()):
             break
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             break
         time.sleep(15)
 
@@ -129,7 +136,7 @@ def main() -> int:
     # the jump, so the jump has to be answering first.
     jump_ip = yaml.safe_load(TOPOLOGY.read_text())["jump_server"]["external_ip"].split("/")[0]
     log(f"waiting for jump {jump_ip} to accept SSH")
-    if not wait_for_ssh(jump_ip, time.time() + JUMP_SSH_WAIT):
+    if not wait_for_ssh(jump_ip, time.monotonic() + JUMP_SSH_WAIT):
         log(f"FAILED: jump {jump_ip} not accepting SSH after {JUMP_SSH_WAIT}s")
         return 1
 
@@ -158,8 +165,36 @@ def main() -> int:
         log(f"FAILED: bootstrap_ssh.py still exiting {rc.returncode}")
         return 1
 
+    kick_l3vni()
     log("fabric up")
     return 0
+
+
+def kick_l3vni() -> None:
+    """Re-bind the L3VNI on every leaf once the fabric is up.
+
+    IOL QUIRK, measured 26 Sep 2026: after a cold boot the L3VNI shows Up, but the
+    leaves' type-5 routes go out carrying only the route target -- no router MAC,
+    no VXLAN encap community -- so no L3CP peer forms and every routed packet
+    between leaves is dropped. A soft BGP refresh does not fix it; removing and
+    re-adding 'member vni ... vrf' on nve1 does, immediately. Harmless when the
+    VNI is already healthy, so it runs unconditionally.
+    """
+    topo = yaml.safe_load(TOPOLOGY.read_text())
+    tenant = (topo.get("overlay") or {}).get("tenant")
+    if not tenant:
+        return
+    vni = topo["overlay"]["vni_base"] + tenant["l3vni_vlan"]
+    from scripts.fabric_nat import ios
+    from scripts.lab_ssh import Host
+    with Host(topo["jump_server"]["external_ip"].split("/")[0]) as jump:
+        for leaf in topo["leaves"]:
+            ios(jump, leaf["loopback"], [
+                "interface nve1",
+                f" no member vni {vni} vrf {tenant['vrf']}",
+                f" member vni {vni} vrf {tenant['vrf']}",
+            ])
+            log(f"  {leaf['name']}: L3VNI {vni} re-bound")
 
 
 if __name__ == "__main__":

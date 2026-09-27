@@ -65,8 +65,8 @@ except Exception as exc:
 s.settimeout(5)
 
 def read(t=3.0):
-    end, out = time.time() + t, b""
-    while time.time() < end:
+    end, out = time.monotonic() + t, b""
+    while time.monotonic() < end:
         try:
             d = s.recv(4096)
             if not d: break

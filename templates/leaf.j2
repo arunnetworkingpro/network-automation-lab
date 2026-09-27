@@ -2,10 +2,10 @@
 ! Source of truth: topology/dc-fabric.yml + topology/link-map.yml
 !
 ! A leaf does the work the spine refuses to: it terminates hosts, owns the SVIs,
-! and routes between VLANs locally. An SVI exists here only if this leaf actually
-! has a host in that VLAN -- there is no L2 between leaves in Phase 1, so a second
-! copy of the same gateway address would be a duplicate, not an anycast. Phase 2
-! and EVPN are what make that same address legitimately anycast.
+! and routes between VLANs locally. In Phase 1 an SVI exists here only if this leaf
+! has a host in that VLAN -- with no L2 between leaves a second copy of the same
+! gateway would be a duplicate address. Phase 2b's EVPN anycast gateway is what
+! makes that same address legitimately present on every leaf.
 !
 hostname {{ name }}
 !
@@ -29,11 +29,71 @@ ip ssh pubkey-chain
  exit
 !
 {% endif %}
+! VTP transparent, or none of the 'vlan' lines below do anything. A wiped IOL
+! switch boots as a VTP server, which keeps VLANs in vlan.dat and silently skips
+! 'vlan N' in the startup-config. VLANs with an access port got auto-created
+! anyway (as VLAN0010, not 'app') -- which hid this until the L3VNI VLAN, which
+! has no port by design, never came up. Also why leaf2 sent no EVPN type-3 route
+! in Phase 2a: VLAN 10 did not exist there until a host was plugged in.
+vtp mode transparent
+!
 {% for v in vlans %}
 vlan {{ v.id }}
  name {{ v.name }}
 !
 {% endfor %}
+{% if tenant %}
+! ---- Phase 2b: tenant VRF ---------------------------------------------------
+!
+! Tenant host subnets are routed in VRF {{ tenant.vrf }}, not the global table. The
+! 'stitching' route targets are the EVPN side of the same RT (what goes on type-2
+! MAC/IP and type-5 routes); the plain ones are the IP VRF side. Same value for
+! both, one AS -- nothing to keep in sync by hand.
+!
+! The leak: the jump's mgmt VLAN, the home LAN and a default come in from global
+! (import map), and the tenant subnets go out to global (export map).
+!
+{% for p in leak.to_tenant %}
+ip prefix-list MGMT-NETS seq {{ loop.index * 5 }} permit {{ p }}
+{% endfor %}
+{% for p in leak.to_global %}
+ip prefix-list TENANT-NETS seq {{ loop.index * 5 }} permit {{ p }}
+{% endfor %}
+{% for p in leak.to_global %}
+ip prefix-list TENANT-HOSTS seq {{ loop.index * 5 }} permit {{ p }} ge 32
+{% endfor %}
+!
+route-map GLOBAL-TO-TENANT permit 10
+ match ip address prefix-list MGMT-NETS
+!
+route-map TENANT-TO-GLOBAL permit 10
+ match ip address prefix-list TENANT-NETS
+!
+! Host /32s too, but pinned to this leaf with no-advertise. Without them the
+! global table only has the anycast /24 as "connected", so traffic from the jump
+! to a host on ANOTHER leaf is ARPed for locally -- and the host's ARP reply goes
+! to the anycast MAC, which its own leaf owns and swallows. The /32 steers the
+! lookup across the L3VNI instead; no-advertise keeps host routes out of the
+! underlay's BGP (the spines never see them).
+route-map TENANT-TO-GLOBAL permit 20
+ match ip address prefix-list TENANT-HOSTS
+ set community no-advertise
+!
+vrf definition {{ tenant.vrf }}
+ rd {{ loopback }}:1
+ !
+ address-family ipv4
+  route-target export {{ tenant.route_target }}
+  route-target import {{ tenant.route_target }}
+  route-target export {{ tenant.route_target }} stitching
+  route-target import {{ tenant.route_target }} stitching
+  import ipv4 unicast map GLOBAL-TO-TENANT
+  ! allow-evpn: without it only locally-originated VRF routes are exported, so
+  ! the remote host /32s (learned as EVPN type-2) would never reach global.
+  export ipv4 unicast map TENANT-TO-GLOBAL allow-evpn
+ exit-address-family
+!
+{% endif %}
 {% if dhcp_pools %}
 ! Host addressing is handed out by the leaf, not baked into the host.
 !
@@ -42,17 +102,18 @@ vlan {{ v.id }}
 ! host directly is a dead end. DHCP sidesteps it entirely, and is what a real
 ! data center does anyway.
 !
-! Each pool is deliberately narrowed to exactly one usable address by the
-! exclusions below, so the host gets a deterministic IP without needing a MAC
-! reservation. One server per VLAN today; widen the exclusions to widen the pool.
-{% for p in dhcp_pools %}
-ip dhcp excluded-address {{ p.exclude_low_start }} {{ p.exclude_low_end }}
-ip dhcp excluded-address {{ p.exclude_high_start }} {{ p.exclude_high_end }}
-{% endfor %}
-!
+! One manual binding per host, keyed on the client-id of its fixed MAC (derived
+! from its IP, see cml/hosts.py) -- no address pool at all, so an unknown client
+! is offered nothing. A stretched VLAN's bindings exist on every leaf, because
+! every leaf hears its broadcasts; identical bindings behind an identical anycast
+! server address make it irrelevant which leaf answers first.
 {% for p in dhcp_pools %}
 ip dhcp pool {{ p.name }}
- network {{ p.network }} {{ p.netmask }}
+{% if p.vrf %}
+ vrf {{ p.vrf }}
+{% endif %}
+ host {{ p.host }} {{ p.netmask }}
+ client-identifier {{ p.client_id }}
  default-router {{ p.gateway }}
  dns-server {{ p.dns }}
  lease 0 8
@@ -87,8 +148,23 @@ interface {{ a.intf }}
 {% endfor %}
 {% for v in svis %}
 interface Vlan{{ v.id }}
- description {{ v.name }} gateway
+ description {{ v.name }} {{ 'anycast ' if v.anycast }}gateway
+{% if v.vrf %}
+ ! Same MAC on every leaf, not just the same IP: a host that moves leaves keeps
+ ! a valid ARP entry for its gateway. Harmless on a VLAN that is not stretched.
+ mac-address {{ tenant.gateway_mac }}
+ ! vrf forwarding clears any address, so it must come before 'ip address'.
+ vrf forwarding {{ v.vrf }}
+{% endif %}
  ip address {{ v.gateway }} {{ v.netmask }}
+{% if v.anycast %}
+ ! IOL QUIRK, measured 26 Sep 2026: on ioll2-xe, CEF drops packets routed out of
+ ! or into an SVI whose VLAN is bound to an EVPN instance. Traffic the leaf
+ ! originates itself works (process-switched), which is why pings FROM the leaf
+ ! succeeded while jump -> srv-app1 failed. Process switching this one SVI fixes
+ ! it with EVPN still bound. Real Catalyst hardware does not need this line.
+ no ip route-cache
+{% endif %}
  no shutdown
 !
 {% endfor %}
@@ -100,6 +176,7 @@ interface Vlan{{ v.id }}
 !
 l2vpn evpn
  replication-type {{ overlay.replication }}
+ router-id Loopback0
 !
 {% for v in evpn_vlans %}
 ! VLAN {{ v.id }} -> VNI {{ v.vni }}. Route targets are auto-derived (evi-id based),
@@ -113,6 +190,29 @@ vlan configuration {{ v.id }}
  member evpn-instance {{ v.evi }} vni {{ v.vni }}
 !
 {% endfor %}
+{% if tenant %}
+! The L3VNI: one VNI per VRF, carrying every routed packet between leaves
+! (symmetric IRB -- both ingress and egress leaf route). It needs a VLAN and an
+! SVI to hang the VRF on, but no hosts and no address of its own.
+vlan {{ tenant.l3vni_vlan }}
+ name l3vni-{{ tenant.vrf | lower }}
+!
+vlan configuration {{ tenant.l3vni_vlan }}
+ member vni {{ tenant.l3vni }}
+!
+interface Vlan{{ tenant.l3vni_vlan }}
+ description L3VNI {{ tenant.l3vni }} for VRF {{ tenant.vrf }}
+ vrf forwarding {{ tenant.vrf }}
+ ip unnumbered Loopback0
+ ! up even with no access port in the VLAN -- nothing local ever joins it
+ no autostate
+ ! Same IOL CEF quirk as the anycast SVIs: a packet decapsulated off the L3VNI and
+ ! routed on to a local host is dropped on the fast path (leaf2 -> leaf1 worked,
+ ! leaf1 -> leaf2 did not, on identical config). Process switching fixes it.
+ no ip route-cache
+ no shutdown
+!
+{% endif %}
 ! One tunnel interface carries every VNI. Sourcing it from Loopback0 is what makes
 ! the overlay inherit the underlay's ECMP -- the tunnel follows whichever spine
 ! OSPF prefers, and survives losing one.
@@ -125,6 +225,9 @@ interface nve1
 {% for v in evpn_vlans %}
  member vni {{ v.vni }} ingress-replication
 {% endfor %}
+{% if tenant %}
+ member vni {{ tenant.l3vni }} vrf {{ tenant.vrf }}
+{% endif %}
 !
 {% endif %}
 router ospf 1
@@ -163,6 +266,15 @@ router bgp {{ asn }}
 {% for s in spines %}
   neighbor {{ s }} activate
 {% endfor %}
+ exit-address-family
+{% endif %}
+{% if tenant %}
+ !
+ ! Connected tenant subnets become type-5 routes; host MAC/IPs are type-2 on
+ ! their own. Remote subnets come back in the same way, via the L3VNI.
+ address-family ipv4 vrf {{ tenant.vrf }}
+  advertise l2vpn evpn
+  redistribute connected
  exit-address-family
 {% endif %}
 !

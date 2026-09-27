@@ -67,3 +67,19 @@ links:
     node: ext
     interface: port
     connector: System Bridge
+- a:
+    node: rdma1
+    interface: ens2
+    ip: 10.10.20.12/24
+  b:
+    node: leaf2
+    interface: Ethernet0/1
+    access_vlan: 20
+- a:
+    node: srv-app2
+    interface: eth0
+    ip: 10.10.10.12/24
+  b:
+    node: leaf2
+    interface: Ethernet0/3
+    access_vlan: 10

@@ -343,10 +343,30 @@ minute, and 134 CML series plus 281 from the Pi leaves most of the 10,000 spare.
   17.16.1a `ADVENTERPRISEK9` and carry the full EVPN stack, so the fabric did not have to
   shrink to fit NX-OSv. One wrinkle worth knowing — `ioll2-xe` reports EVPN *Vlans*
   (VLAN-based service) where `iol-xe` reports *Bridge Domains*, and that shapes the config.
-- **In progress:** a second VLAN 10 host on leaf2, so leaf2 originates a type-3 route, NVE
-  peering forms in both directions, and a ping actually crosses the tunnel. Until that
-  passes, the overlay is configured but not proven end to end.
-- Phase 2b: distributed anycast gateway
+- **Phase 2a overlay — proven end to end.** `srv-app2` (leaf2, VLAN 10) pings
+  `srv-app1` (leaf1, VLAN 10) as pure L2 across the VXLAN tunnel — the gate for
+  claiming the overlay works.
+- **Phase 2b — built and verified: symmetric IRB + distributed anycast gateway.**
+  VLANs 10/20 route in VRF `TENANT`; VLAN 10's gateway (10.10.10.1, MAC
+  0000.0a0a.0001) is on every leaf; leaf-to-leaf routing rides the L3VNI (VLAN 900 →
+  VNI 10900), VLAN 20 is a type-5 route. Mgmt (VLAN 30, the jump) stays in the
+  global table with an explicit leak both ways; host /32s leak to global pinned
+  with `no-advertise`, so the spines never see them. `verify.py` is 12/12 from a
+  cold day-0 push. Hosts get addresses by DHCP reservation on a MAC derived from
+  their IP (`cml/hosts.py`), added with `scripts/add_server.py`.
+  IOL quirks found on the way, each documented where it is worked around:
+  - `ioll2-xe` CEF drops packets routed into/out of EVPN-bound SVIs and packets
+    decapsulated off the L3VNI → `no ip route-cache` on those SVIs (leaf.j2).
+    This was the "leaf1 won't route Vlan30 → Vlan10" fault.
+  - A wiped IOL switch is a VTP server and ignores `vlan N` in startup-config →
+    `vtp mode transparent`. VLANs only existed where a port auto-created them.
+  - After a cold boot type-5 routes lack the router-MAC/encap communities →
+    `lab_up.py` re-binds the L3VNI once the fabric is up.
+  - Anycast gateway ARP trap: without host /32s in global, jump → a host on the
+    *other* leaf ARPs locally and the reply is swallowed by the host's own leaf.
+- **Unattended cold start fixed.** `lab_up.py` deadlines use a monotonic clock: the
+  Pi has no RTC, NTP steps the clock hours forward at boot, and wall-clock
+  deadlines "expired" 23 s in.
 - **RDMA / Soft-RoCE — working, cross-fabric.** `rdma1` (ubuntu, `leaf2`/VLAN 20) sits
   deliberately opposite `jump` in the topology, so `ib_send_bw` between the two RoCE
   hosts crosses `leaf1 → spine → leaf2` and measures the fabric rather than loopback.

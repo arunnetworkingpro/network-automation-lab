@@ -10,6 +10,7 @@ something is wrong:
     3. jump -> loopbacks              -- is OSPF up across the /31s?
     4. jump -> a server in each VLAN  -- is BGP carrying the host subnets?
     5. server -> server across leaves -- ECMP and inter-VLAN routing end to end
+    6. tenant host -> host            -- L2VNI, L3VNI and the leaked default
 
 Everything runs over one SSH session to the jump. The Pi cannot reach 10.0.0.0/8
 directly until the home router has the static route, which is exactly why these
@@ -101,6 +102,37 @@ def main() -> None:
             passed += 1
         else:
             failed += 1
+
+    # 6. host to host, from inside the tenant VRF. The jump sits in the global
+    # table, so everything above crossed the leak; these do not touch it.
+    #   same VLAN, other leaf  -> pure L2 over VXLAN (L2VNI, type-2 routes)
+    #   other VLAN, other leaf -> symmetric IRB over the L3VNI (type-5 route)
+    #   internet               -> tenant default leaked from global, then NAT
+    overlay = topo.get("overlay") or {}
+    if overlay.get("tenant"):
+        console.rule("[bold]6. tenant overlay (from srv-app1)")
+        src = next(s for s in topo["servers"] if s["name"] == "srv-app1")
+        jt = cli.get_transport().open_channel(
+            "direct-tcpip", (src["ip"].split("/")[0], 22), ("127.0.0.1", 0))
+        host = paramiko.SSHClient()
+        host.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        host.connect(src["ip"].split("/")[0], username="arun", password=pw, sock=jt,
+                     timeout=30, look_for_keys=False, allow_agent=False)
+        for srv in topo["servers"]:
+            if srv["name"] == src["name"]:
+                continue
+            how = ("L2 over VXLAN" if srv["vlan"] == src["vlan"] else "L3VNI")
+            if check(host, f"srv-app1 -> {srv['name']} ({how}, {srv['leaf']})",
+                     f"ping -c3 -W2 {srv['ip'].split('/')[0]}"):
+                passed += 1
+            else:
+                failed += 1
+        if check(host, "srv-app1 -> internet 1.1.1.1 (leaked default, NAT)",
+                 "ping -c3 -W3 1.1.1.1"):
+            passed += 1
+        else:
+            failed += 1
+        host.close()
 
     console.rule("[bold]summary")
     console.print(f"  [green]{passed} passed[/green]   [red]{failed} failed[/red]")
