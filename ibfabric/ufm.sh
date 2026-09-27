@@ -20,7 +20,7 @@ rm -rf "$work"/sys-* 2>/dev/null
 
 if [ $# -gt 0 ]; then
     source "$HERE/ibenv.sh" >/dev/null 2>&1
-    export SIM_HOST=$host PATH="$PATH:/usr/sbin:/sbin"
+    export SIM_HOST=$host PATH="$PATH:/usr/sbin:/sbin:$HERE/bin"
     "$@" 2> >(grep -v '^ibwarn' >&2)
     rc=$?
     rm -rf "$work"/sys-* 2>/dev/null
